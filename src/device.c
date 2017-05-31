@@ -352,10 +352,38 @@ static int newlink(struct net *src_net, struct net_device *dev, struct nlattr *t
 	if (ret < 0)
 		goto error_10;
 
+#ifdef CONFIG_SYSFS
+	wg->kset = kset_create_and_add("wireguard", NULL, &dev->dev.kobj);
+	if (!wg->kset)
+		goto error_11;
+
+#ifdef CONFIG_WIREGUARD_PARALLEL
+	wg->encrypt_pd->kobj.kset = wg->kset;
+	ret = kobject_add(&wg->encrypt_pd->kobj, NULL, "encrypt_pd");
+	if (ret)
+		goto error_12;
+	kobject_uevent(&wg->encrypt_pd->kobj, KOBJ_ADD);
+
+	wg->decrypt_pd->kobj.kset = wg->kset;
+	ret = kobject_add(&wg->decrypt_pd->kobj, NULL, "decrypt_pd");
+	if (ret)
+		goto error_12;
+	kobject_uevent(&wg->decrypt_pd->kobj, KOBJ_ADD);
+#endif
+#endif
+
 	pr_debug("%s: Interface created\n", dev->name);
 
 	return 0;
 
+#ifdef CONFIG_SYSFS
+#ifdef CONFIG_WIREGUARD_PARALLEL
+error_12:
+	kset_unregister(wg->kset);
+#endif
+error_11:
+	unregister_netdevice(dev);
+#endif
 error_10:
 #ifdef CONFIG_PM_SLEEP
 	unregister_pm_notifier(&wg->clear_peers_on_suspend);

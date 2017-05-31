@@ -11,6 +11,7 @@
 #include <linux/types.h>
 #include <linux/netdevice.h>
 #include <linux/workqueue.h>
+#include <linux/kobject.h>
 #include <linux/mutex.h>
 #include <linux/net.h>
 #include <linux/padata.h>
@@ -27,6 +28,7 @@ struct wireguard_device {
 	u16 incoming_port;
 	u32 fwmark;
 	struct net *creating_net;
+	struct kset *kset;
 	struct noise_static_identity static_identity;
 	struct workqueue_struct *incoming_handshake_wq, *peer_wq;
 	struct sk_buff_head incoming_handshakes;
