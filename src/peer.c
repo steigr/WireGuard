@@ -16,6 +16,7 @@ static atomic64_t peer_counter = ATOMIC64_INIT(0);
 
 struct wireguard_peer *peer_create(struct wireguard_device *wg, const u8 public_key[NOISE_PUBLIC_KEY_LEN], const u8 preshared_key[NOISE_SYMMETRIC_KEY_LEN])
 {
+	int cpu;
 	struct wireguard_peer *peer;
 	lockdep_assert_held(&wg->device_update_lock);
 
@@ -41,14 +42,23 @@ struct wireguard_peer *peer_create(struct wireguard_device *wg, const u8 public_
 	cookie_checker_precompute_peer_keys(peer);
 	mutex_init(&peer->keypairs.keypair_update_lock);
 	INIT_WORK(&peer->transmit_handshake_work, packet_send_queued_handshakes);
+	INIT_WORK(&peer->packet_init_work, packet_initialization_worker);
+	INIT_WORK(&peer->packet_transmit_work, packet_transmission_worker);
+	peer->packet_encrypt_work = alloc_percpu(struct percpu_work);
+	if (!peer->packet_encrypt_work) {
+		kfree(peer);
+		return NULL;
+	}
+	for_each_possible_cpu(cpu) {
+		struct percpu_work *work = per_cpu_ptr(peer->packet_encrypt_work, cpu);
+		INIT_WORK(&work->work, packet_encryption_worker);
+		work->peer = peer;
+	}
 	rwlock_init(&peer->endpoint_lock);
 	skb_queue_head_init(&peer->tx_packet_queue);
 	kref_init(&peer->refcount);
 	pubkey_hashtable_add(&wg->peer_hashtable, peer);
 	list_add_tail(&peer->peer_list, &wg->peer_list);
-#ifdef CONFIG_WIREGUARD_PARALLEL
-	atomic_set(&peer->parallel_encryption_inflight, 0);
-#endif
 	pr_debug("%s: Peer %Lu created\n", netdev_pub(wg)->name, peer->internal_id);
 	return peer;
 }
@@ -86,6 +96,7 @@ void peer_remove(struct wireguard_peer *peer)
 	if (peer->device->peer_wq)
 		flush_workqueue(peer->device->peer_wq);
 	skb_queue_purge(&peer->tx_packet_queue);
+	free_percpu(peer->packet_encrypt_work);
 	peer_put(peer);
 }
 

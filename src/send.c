@@ -1,19 +1,23 @@
 /* Copyright (C) 2015-2017 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved. */
 
-#include "packets.h"
-#include "timers.h"
-#include "device.h"
-#include "peer.h"
-#include "socket.h"
-#include "messages.h"
 #include "cookie.h"
+#include "device.h"
+#include "messages.h"
+#include "packets.h"
+#include "peer.h"
+#include "queue.h"
+#include "socket.h"
+#include "timers.h"
 
-#include <linux/uio.h>
 #include <linux/inetdevice.h>
-#include <linux/socket.h>
 #include <linux/jiffies.h>
-#include <net/udp.h>
+#include <linux/socket.h>
+#include <linux/uio.h>
+#include <net/ip_tunnels.h>
 #include <net/sock.h>
+#include <net/udp.h>
+
+#define MAX_QUEUE_WORK 64
 
 static void packet_send_handshake_initiation(struct wireguard_peer *peer)
 {
@@ -58,9 +62,9 @@ void packet_queue_handshake_initiation(struct wireguard_peer *peer, bool is_retr
 	if (unlikely(!peer))
 		return;
 
-	/* Queues up calling packet_send_queued_handshakes(peer), where we do a peer_put(peer) after: */
+	/* Queues up calling packet_send_queued_handshakes(peer), where we do a peer_put(peer). */
 	if (!queue_work(peer->device->peer_wq, &peer->transmit_handshake_work))
-		peer_put(peer); /* If the work was already queued, we want to drop the extra reference */
+		peer_put(peer); /* If the work was already queued, drop the extra reference. */
 }
 
 void packet_send_handshake_response(struct wireguard_peer *peer)
@@ -89,6 +93,58 @@ void packet_send_handshake_cookie(struct wireguard_device *wg, struct sk_buff *i
 	socket_send_buffer_as_reply_to_skb(wg, initiating_skb, &packet, sizeof(packet));
 }
 
+void packet_send_keepalive(struct wireguard_peer *peer)
+{
+	struct sk_buff *skb;
+	if (skb_queue_empty(&peer->tx_packet_queue)) {
+		skb = alloc_skb(DATA_PACKET_HEAD_ROOM + MESSAGE_MINIMUM_LENGTH, GFP_ATOMIC);
+		if (unlikely(!skb))
+			return;
+		skb_reserve(skb, DATA_PACKET_HEAD_ROOM);
+		skb->dev = netdev_pub(peer->device);
+		enqueue_packet(&peer->tx_packet_queue, skb);
+		net_dbg_ratelimited("%s: Sending keepalive packet to peer %Lu (%pISpfsc)\n", netdev_pub(peer->device)->name, peer->internal_id, &peer->endpoint.addr);
+	} else {
+		net_dbg_ratelimited("%s: NOT sending keepalive to peer %Lu (%pISpfsc)\n", netdev_pub(peer->device)->name, peer->internal_id, &peer->endpoint.addr);
+	}
+	packet_send_queue(peer);
+}
+
+static inline void update_send_delay_stats(struct wireguard_peer *peer, struct timespec delay)
+{
+	struct wireguard_device *wg = peer->device;
+
+	s64 delay_ns = timespec_to_ns(&delay), max_delay, mean_delay, new_delay, sent_packets;
+
+	if (delay_ns <= 0) {
+		net_dbg_ratelimited("%s: Negative delay! %lld ns\n", netdev_pub(wg)->name, delay_ns);
+		return;
+	}
+retry:
+	sent_packets = atomic64_read(&wg->sent_packets);
+	mean_delay = atomic64_read(&wg->mean_send_delay);
+	/* Take care to compensate for integer division. */
+	new_delay = ((mean_delay + 500) * 999 + delay_ns) / 1000;
+	if (atomic64_cmpxchg(&wg->sent_packets, sent_packets, sent_packets + 1) != sent_packets)
+		goto retry;
+	if (atomic64_cmpxchg(&wg->mean_send_delay, mean_delay, new_delay) != mean_delay) {
+		atomic64_dec(&wg->sent_packets);
+		goto retry;
+	}
+	/* Avoid spamming dmesg. */
+	if (sent_packets % 100000 == 0)
+		net_dbg_ratelimited("%s: Mean delay is %lld ns, qlen is %d\n", netdev_pub(wg)->name, new_delay, peer->tx_packet_queue.qlen);
+retry2:
+	max_delay = atomic64_read(&wg->max_send_delay);
+	if (delay_ns > max_delay) {
+		if (atomic64_cmpxchg(&wg->max_send_delay, max_delay, delay_ns) != max_delay)
+			goto retry2;
+		/* Avoid spamming dmesg. */
+		if (delay_ns > max_delay + 1000)
+			net_dbg_ratelimited("%s: Max delay is %lld ns\n", netdev_pub(wg)->name, delay_ns);
+	}
+}
+
 static inline void keep_key_fresh(struct wireguard_peer *peer)
 {
 	struct noise_keypair *keypair;
@@ -106,92 +162,207 @@ static inline void keep_key_fresh(struct wireguard_peer *peer)
 		packet_queue_handshake_initiation(peer, false);
 }
 
-void packet_send_keepalive(struct wireguard_peer *peer)
+void packet_transmission_worker(struct work_struct *work)
 {
-	struct sk_buff *skb;
-	if (!skb_queue_len(&peer->tx_packet_queue)) {
-		skb = alloc_skb(DATA_PACKET_HEAD_ROOM + MESSAGE_MINIMUM_LENGTH, GFP_ATOMIC);
-		if (unlikely(!skb))
-			return;
-		skb_reserve(skb, DATA_PACKET_HEAD_ROOM);
-		skb->dev = netdev_pub(peer->device);
-		skb_queue_tail(&peer->tx_packet_queue, skb);
-		net_dbg_ratelimited("%s: Sending keepalive packet to peer %Lu (%pISpfsc)\n", netdev_pub(peer->device)->name, peer->internal_id, &peer->endpoint.addr);
-	}
-	packet_send_queue(peer);
-}
+	bool data_sent = false;
+	struct sk_buff *next, *skb;
+	struct wireguard_peer *peer = container_of(work, struct wireguard_peer, packet_transmit_work);
 
-void packet_create_data_done(struct sk_buff_head *queue, struct wireguard_peer *peer)
-{
-	struct sk_buff *skb, *tmp;
-	bool is_keepalive, data_sent = false;
-
-	if (unlikely(!skb_queue_len(queue)))
+	if (!(skb = dequeue_packets(&peer->tx_packet_queue, PACKET_TX_ENCRYPTED)))
 		return;
-
 	timers_any_authenticated_packet_traversal(peer);
-	skb_queue_walk_safe (queue, skb, tmp) {
-		is_keepalive = skb->len == message_data_len(0);
+	while (skb) {
+		bool is_keepalive = skb->len == message_data_len(0);
+		struct timespec now;
+
+		getnstimeofday(&now);
+		update_send_delay_stats(peer, timespec_sub(now, PACKET_CB(skb)->ts));
+		next = skb->next;
 		if (likely(!socket_send_skb_to_peer(peer, skb, PACKET_CB(skb)->ds) && !is_keepalive))
 			data_sent = true;
+		skb = next;
 	}
+
 	if (likely(data_sent))
 		timers_data_sent(peer);
-
 	keep_key_fresh(peer);
+}
 
-	if (unlikely(peer->need_resend_queue))
-		packet_send_queue(peer);
+static inline unsigned int skb_padding(struct sk_buff *skb)
+{
+	/* We do this modulo business with the MTU, just in case the networking layer
+	 * gives us a packet that's bigger than the MTU. Now that we support GSO, this
+	 * shouldn't be a real problem, and this can likely be removed. But, caution! */
+	unsigned int last_unit = skb->len % skb->dev->mtu;
+	unsigned int padded_size = (last_unit + MESSAGE_PADDING_MULTIPLE - 1) & ~(MESSAGE_PADDING_MULTIPLE - 1);
+	if (padded_size > skb->dev->mtu)
+		padded_size = skb->dev->mtu;
+	return padded_size - last_unit;
+}
+
+static inline bool skb_encrypt(struct sk_buff *skb, struct noise_keypair *keypair, bool have_simd)
+{
+	struct scatterlist sg[MAX_SKB_FRAGS * 2 + 1];
+	struct message_data *header;
+	unsigned int padding_len, plaintext_len, trailer_len;
+	int num_frags;
+	struct sk_buff *trailer;
+
+	/* Store the ds bit in the cb */
+	PACKET_CB(skb)->ds = ip_tunnel_ecn_encap(0 /* No outer TOS: no leak. TODO: should we use flowi->tos as outer? */, ip_hdr(skb), skb);
+
+	/* Calculate lengths */
+	padding_len = skb_padding(skb);
+	trailer_len = padding_len + noise_encrypted_len(0);
+	plaintext_len = skb->len + padding_len;
+
+	/* Expand data section to have room for padding and auth tag */
+	num_frags = skb_cow_data(skb, trailer_len, &trailer);
+	if (unlikely(num_frags < 0 || num_frags > ARRAY_SIZE(sg)))
+		return false;
+
+	/* Set the padding to zeros, and make sure it and the auth tag are part of the skb */
+	memset(skb_tail_pointer(trailer), 0, padding_len);
+
+	/* Expand head section to have room for our header and the network stack's headers. */
+	if (unlikely(skb_cow_head(skb, DATA_PACKET_HEAD_ROOM) < 0))
+		return false;
+
+	/* We have to remember to add the checksum to the innerpacket, in case the receiver forwards it. */
+	if (likely(!skb_checksum_setup(skb, true)))
+		skb_checksum_help(skb);
+
+	/* Only after checksumming can we safely add on the padding at the end and the header. */
+	header = (struct message_data *)skb_push(skb, sizeof(struct message_data));
+	header->header.type = cpu_to_le32(MESSAGE_DATA);
+	header->key_idx = keypair->remote_index;
+	header->counter = cpu_to_le64(PACKET_CB(skb)->nonce);
+	pskb_put(skb, trailer, trailer_len);
+
+	/* Now we can encrypt the scattergather segments */
+	sg_init_table(sg, num_frags);
+	if (skb_to_sgvec(skb, sg, sizeof(struct message_data), noise_encrypted_len(plaintext_len)) <= 0)
+		return false;
+	return chacha20poly1305_encrypt_sg(sg, sg, plaintext_len, NULL, 0, PACKET_CB(skb)->nonce, keypair->sending.key, have_simd);
+}
+
+void packet_encryption_worker(struct work_struct *work)
+{
+	bool have_simd;
+	int processed = 0;
+	struct sk_buff *next, *skb;
+	struct wireguard_peer *peer = container_of(work, struct percpu_work, work)->peer;
+
+	if (!(skb = claim_first_packet(&peer->tx_packet_queue, PACKET_TX_INITIALIZED)))
+		return;
+	have_simd = chacha20poly1305_init_simd();
+	while (skb && ++processed <= MAX_QUEUE_WORK) {
+		bool success = false;
+
+		if (unlikely(!skb_encrypt(skb, PACKET_CB(skb)->keypair, have_simd))) {
+			net_dbg_ratelimited("%s: encrypt failed!!!! skb = %p\n", netdev_pub(peer->device)->name, skb);
+			goto finished;
+		}
+		skb_reset(skb);
+		noise_keypair_put(PACKET_CB(skb)->keypair);
+		success = true;
+
+finished:
+		/* Acquire the next packet before releasing this one to avoid locking list traversal. */
+		next = claim_next_packet(&peer->tx_packet_queue, skb, PACKET_TX_INITIALIZED);
+		release_packet(skb, success);
+		skb = next;
+	}
+	chacha20poly1305_deinit_simd(have_simd);
+
+	queue_work(peer->device->crypt_wq, &peer->packet_transmit_work);
+	if (skb) {
+		int cpu = get_cpu();
+
+		release_packet(skb, false);
+		/* If there were packets left on the queue, enqueue myself to finish the work. */
+		queue_work_on(cpu, peer->device->crypt_wq, per_cpu_ptr(&peer->packet_encrypt_work->work, cpu));
+		put_cpu();
+	}
+}
+
+static inline bool get_encryption_nonce(u64 *nonce, struct noise_symmetric_key *key)
+{
+	if (unlikely(!key))
+		return false;
+
+	if (unlikely(!key->is_valid || time_is_before_eq_jiffies64(key->birthdate + REJECT_AFTER_TIME))) {
+		key->is_valid = false;
+		return false;
+	}
+
+	*nonce = atomic64_inc_return(&key->counter.counter) - 1;
+	if (*nonce >= REJECT_AFTER_MESSAGES) {
+		key->is_valid = false;
+		return false;
+	}
+
+	return true;
+}
+
+void packet_initialization_worker(struct work_struct *work)
+{
+	int cpu;
+	int processed = 0;
+	struct sk_buff *next, *skb;
+	struct wireguard_peer *peer = container_of(work, struct wireguard_peer, packet_init_work);
+
+	if (!(skb = claim_first_packet(&peer->tx_packet_queue, PACKET_TX_NEW)))
+		return;
+	while (skb && ++processed <= MAX_QUEUE_WORK) {
+		bool success = false;
+		struct noise_keypair *keypair;
+
+		rcu_read_lock_bh();
+		keypair = noise_keypair_get(rcu_dereference_bh(peer->keypairs.current_keypair));
+		rcu_read_unlock_bh();
+
+		if (unlikely(!keypair)) {
+			net_dbg_ratelimited("%s: no keypair!!!! skb = %p\n", netdev_pub(peer->device)->name, skb);
+			packet_queue_handshake_initiation(peer, false);
+			goto finished;
+		}
+		if (unlikely(!get_encryption_nonce(&PACKET_CB(skb)->nonce, &keypair->sending))) {
+			net_dbg_ratelimited("%s: adding nonce failed!!!! skb = %p\n", netdev_pub(peer->device)->name, skb);
+			noise_keypair_put(keypair);
+			goto finished;
+		}
+		PACKET_CB(skb)->keypair = keypair;
+		success = true;
+
+finished:
+		/* Acquire the next packet before releasing this one to avoid locking list traversal. */
+		next = claim_next_packet(&peer->tx_packet_queue, skb, PACKET_TX_NEW);
+		release_packet(skb, success);
+		skb = next;
+	}
+
+	for_each_online_cpu(cpu) {
+		queue_work_on(cpu, peer->device->crypt_wq, per_cpu_ptr(&peer->packet_encrypt_work->work, cpu));
+	}
+	if (skb) {
+		release_packet(skb, false);
+		/* If there were packets left on the queue, enqueue myself to finish the work. */
+		queue_work(peer->device->crypt_wq, &peer->packet_init_work);
+	}
 }
 
 void packet_send_queue(struct wireguard_peer *peer)
 {
-	struct sk_buff_head queue;
+	int cpu;
 
-	peer->need_resend_queue = false;
-
-	/* Steal the current queue into our local one. */
-	skb_queue_head_init(&queue);
-	spin_lock_bh(&peer->tx_packet_queue.lock);
-	skb_queue_splice_init(&peer->tx_packet_queue, &queue);
-	spin_unlock_bh(&peer->tx_packet_queue.lock);
-
-	if (unlikely(!skb_queue_len(&queue)))
+	if (unlikely(skb_queue_empty(&peer->tx_packet_queue)))
 		return;
 
-	/* We submit it for encryption and sending. */
-	switch (packet_create_data(&queue, peer)) {
-	case 0:
-		break;
-	case -EBUSY:
-		/* EBUSY happens when the parallel workers are all filled up, in which
-		 * case we should requeue everything. */
-
-		/* First, we mark that we should try to do this later, when existing
-		 * jobs are done. */
-		peer->need_resend_queue = true;
-
-		/* We stick the remaining skbs from local_queue at the top of the peer's
-		 * queue again, setting the top of local_queue to be the skb that begins
-		 * the requeueing. */
-		spin_lock_bh(&peer->tx_packet_queue.lock);
-		skb_queue_splice(&queue, &peer->tx_packet_queue);
-		spin_unlock_bh(&peer->tx_packet_queue.lock);
-		break;
-	case -ENOKEY:
-		/* ENOKEY means that we don't have a valid session for the peer, which
-		 * means we should initiate a session, but after requeuing like above. */
-
-		spin_lock_bh(&peer->tx_packet_queue.lock);
-		skb_queue_splice(&queue, &peer->tx_packet_queue);
-		spin_unlock_bh(&peer->tx_packet_queue.lock);
-
-		packet_queue_handshake_initiation(peer, false);
-		break;
-	default:
-		/* If we failed for any other reason, we want to just free the packets and
-		 * forget about them. We do this unlocked, since we're the only ones with
-		 * a reference to the local queue. */
-		__skb_queue_purge(&queue);
+	/* We don't know what state the queued packets are in, so try everything. */
+	queue_work(peer->device->crypt_wq, &peer->packet_init_work);
+	for_each_online_cpu(cpu) {
+		queue_work_on(cpu, peer->device->crypt_wq, per_cpu_ptr(&peer->packet_encrypt_work->work, cpu));
 	}
+	queue_work(peer->device->crypt_wq, &peer->packet_transmit_work);
 }

@@ -1,13 +1,14 @@
 /* Copyright (C) 2015-2017 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved. */
 
+#include "config.h"
+#include "device.h"
+#include "messages.h"
 #include "packets.h"
+#include "peer.h"
+#include "queue.h"
 #include "socket.h"
 #include "timers.h"
-#include "device.h"
-#include "config.h"
-#include "peer.h"
 #include "uapi.h"
-#include "messages.h"
 
 #include <linux/module.h>
 #include <linux/rtnetlink.h>
@@ -132,6 +133,7 @@ static netdev_tx_t xmit(struct sk_buff *skb, struct net_device *dev)
 	struct wireguard_device *wg = netdev_priv(dev);
 	struct wireguard_peer *peer;
 	struct sk_buff *next;
+	struct sk_buff_head list;
 	int ret;
 
 	if (unlikely(dev_recursion_level() > 4)) {
@@ -157,14 +159,8 @@ static netdev_tx_t xmit(struct sk_buff *skb, struct net_device *dev)
 		goto err_peer;
 	}
 
-	/* If the queue is getting too big, we start removing the oldest packets until it's small again.
-	 * We do this before adding the new packet, so we don't remove GSO segments that are in excess. */
-	while (skb_queue_len(&peer->tx_packet_queue) > MAX_QUEUED_OUTGOING_PACKETS)
-		dev_kfree_skb(skb_dequeue(&peer->tx_packet_queue));
-
-	if (!skb_is_gso(skb))
-		skb->next = NULL;
-	else {
+	__skb_queue_head_init(&list);
+	if (skb_is_gso(skb)) {
 		struct sk_buff *segs = skb_gso_segment(skb, 0);
 		if (unlikely(IS_ERR(segs))) {
 			ret = PTR_ERR(segs);
@@ -172,10 +168,11 @@ static netdev_tx_t xmit(struct sk_buff *skb, struct net_device *dev)
 		}
 		dev_kfree_skb(skb);
 		skb = segs;
+	} else {
+		skb->next = NULL;
 	}
 	do {
 		next = skb->next;
-		skb->next = skb->prev = NULL;
 
 		skb = skb_share_check(skb, GFP_ATOMIC);
 		if (unlikely(!skb))
@@ -185,8 +182,9 @@ static netdev_tx_t xmit(struct sk_buff *skb, struct net_device *dev)
 		 * so at this point we're in a position to drop it. */
 		skb_dst_drop(skb);
 
-		skb_queue_tail(&peer->tx_packet_queue, skb);
+		__skb_queue_tail(&list, skb);
 	} while ((skb = next) != NULL);
+	enqueue_packet_list(&peer->tx_packet_queue, &list);
 
 	packet_send_queue(peer);
 	peer_put(peer);
@@ -234,7 +232,6 @@ static void destruct(struct net_device *dev)
 	destroy_workqueue(wg->incoming_handshake_wq);
 	destroy_workqueue(wg->peer_wq);
 #ifdef CONFIG_WIREGUARD_PARALLEL
-	padata_free(wg->encrypt_pd);
 	padata_free(wg->decrypt_pd);
 	destroy_workqueue(wg->crypt_wq);
 #endif
@@ -321,16 +318,11 @@ static int newlink(struct net *src_net, struct net_device *dev, struct nlattr *t
 	if (!wg->peer_wq)
 		goto error_4;
 
-#ifdef CONFIG_WIREGUARD_PARALLEL
-	wg->crypt_wq = alloc_workqueue("wg-crypt-%s", WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM, 2, dev->name);
+	wg->crypt_wq = alloc_workqueue("wg-crypt-%s", WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM, 0, dev->name);
 	if (!wg->crypt_wq)
 		goto error_5;
 
-	wg->encrypt_pd = padata_alloc_possible(wg->crypt_wq);
-	if (!wg->encrypt_pd)
-		goto error_6;
-	padata_start(wg->encrypt_pd);
-
+#ifdef CONFIG_WIREGUARD_PARALLEL
 	wg->decrypt_pd = padata_alloc_possible(wg->crypt_wq);
 	if (!wg->decrypt_pd)
 		goto error_7;
@@ -358,12 +350,6 @@ static int newlink(struct net *src_net, struct net_device *dev, struct nlattr *t
 		goto error_11;
 
 #ifdef CONFIG_WIREGUARD_PARALLEL
-	wg->encrypt_pd->kobj.kset = wg->kset;
-	ret = kobject_add(&wg->encrypt_pd->kobj, NULL, "encrypt_pd");
-	if (ret)
-		goto error_12;
-	kobject_uevent(&wg->encrypt_pd->kobj, KOBJ_ADD);
-
 	wg->decrypt_pd->kobj.kset = wg->kset;
 	ret = kobject_add(&wg->decrypt_pd->kobj, NULL, "decrypt_pd");
 	if (ret)
@@ -394,11 +380,9 @@ error_8:
 #ifdef CONFIG_WIREGUARD_PARALLEL
 	padata_free(wg->decrypt_pd);
 error_7:
-	padata_free(wg->encrypt_pd);
-error_6:
+#endif
 	destroy_workqueue(wg->crypt_wq);
 error_5:
-#endif
 	destroy_workqueue(wg->peer_wq);
 error_4:
 	destroy_workqueue(wg->incoming_handshake_wq);

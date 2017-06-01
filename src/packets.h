@@ -15,7 +15,11 @@ struct wireguard_peer;
 struct sk_buff;
 
 struct packet_cb {
+	struct noise_keypair *keypair;
+	struct timespec ts;
 	u64 nonce;
+	u32 sequence;
+	atomic_t state;
 	u8 ds;
 };
 #define PACKET_CB(skb) ((struct packet_cb *)skb->cb)
@@ -32,12 +36,14 @@ void packet_queue_handshake_initiation(struct wireguard_peer *peer, bool is_retr
 void packet_send_queued_handshakes(struct work_struct *work);
 void packet_send_handshake_response(struct wireguard_peer *peer);
 void packet_send_handshake_cookie(struct wireguard_device *wg, struct sk_buff *initiating_skb, __le32 sender_index);
-void packet_create_data_done(struct sk_buff_head *queue, struct wireguard_peer *peer);
 
+void packet_encryption_worker(struct work_struct *work);
+void packet_initialization_worker(struct work_struct *work);
+void packet_transmission_worker(struct work_struct *work);
 
 /* data.c */
-int packet_create_data(struct sk_buff_head *queue, struct wireguard_peer *peer);
 void packet_consume_data(struct sk_buff *skb, struct wireguard_device *wg);
+void skb_reset(struct sk_buff *skb);
 
 #ifdef CONFIG_WIREGUARD_PARALLEL
 int packet_init_data_caches(void);

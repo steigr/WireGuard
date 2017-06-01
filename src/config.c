@@ -202,6 +202,11 @@ int config_set_device(struct wireguard_device *wg, void __user *user_device)
 out:
 	mutex_unlock(&wg->device_update_lock);
 	memzero_explicit(&in_device.private_key, NOISE_PUBLIC_KEY_LEN);
+
+	net_dbg_ratelimited("%s: Resetting device delay stats\n", netdev_pub(wg)->name);
+	atomic64_set(&wg->mean_send_delay, 0);
+	atomic64_set(&wg->sent_packets, 0);
+
 	return ret;
 }
 
