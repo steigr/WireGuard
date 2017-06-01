@@ -285,7 +285,7 @@ int packet_create_data(struct sk_buff_head *queue, struct wireguard_peer *peer)
 
 		/* After the first time through the loop, if we've suceeded with a legitimate nonce,
 		 * then we don't want a -ENOKEY error if subsequent nonces fail. Rather, if this
-		 * condition arises, we simply want error out hard, and drop the entire queue. This
+		 * condition arises, we simply want to error out hard, and drop the entire queue. This
 		 * is partially lazy programming and TODO: this could be made to only requeue the
 		 * ones that had no nonce. But I'm not sure it's worth the added complexity, given
 		 * how rarely that condition should arise. */
