@@ -96,7 +96,7 @@ void packet_send_handshake_cookie(struct wireguard_device *wg, struct sk_buff *i
 void packet_send_keepalive(struct wireguard_peer *peer)
 {
 	struct sk_buff *skb;
-	if (skb_queue_empty(&peer->tx_packet_queue)) {
+	if (skb_queue_empty(&peer->tx_packet_queue.head)) {
 		skb = alloc_skb(DATA_PACKET_HEAD_ROOM + MESSAGE_MINIMUM_LENGTH, GFP_ATOMIC);
 		if (unlikely(!skb))
 			return;
@@ -133,7 +133,10 @@ retry:
 	}
 	/* Avoid spamming dmesg. */
 	if (sent_packets % 100000 == 0)
-		net_dbg_ratelimited("%s: Mean delay is %lld ns, qlen is %d\n", netdev_pub(wg)->name, new_delay, peer->tx_packet_queue.qlen);
+		net_dbg_ratelimited("%s: Mean delay is %lld ns, qlen is %d %d %d\n", netdev_pub(wg)->name, new_delay,
+				atomic_read(&peer->tx_packet_queue.new_packets),
+				atomic_read(&peer->tx_packet_queue.initialized_packets),
+				atomic_read(&peer->tx_packet_queue.encrypted_packets));
 retry2:
 	max_delay = atomic64_read(&wg->max_send_delay);
 	if (delay_ns > max_delay) {
@@ -160,32 +163,6 @@ static inline void keep_key_fresh(struct wireguard_peer *peer)
 
 	if (send)
 		packet_queue_handshake_initiation(peer, false);
-}
-
-void packet_transmission_worker(struct work_struct *work)
-{
-	bool data_sent = false;
-	struct sk_buff *next, *skb;
-	struct wireguard_peer *peer = container_of(work, struct wireguard_peer, packet_transmit_work);
-
-	if (!(skb = dequeue_packets(&peer->tx_packet_queue, PACKET_TX_ENCRYPTED)))
-		return;
-	timers_any_authenticated_packet_traversal(peer);
-	while (skb) {
-		bool is_keepalive = skb->len == message_data_len(0);
-		struct timespec now;
-
-		getnstimeofday(&now);
-		update_send_delay_stats(peer, timespec_sub(now, PACKET_CB(skb)->ts));
-		next = skb->next;
-		if (likely(!socket_send_skb_to_peer(peer, skb, PACKET_CB(skb)->ds) && !is_keepalive))
-			data_sent = true;
-		skb = next;
-	}
-
-	if (likely(data_sent))
-		timers_data_sent(peer);
-	keep_key_fresh(peer);
 }
 
 static inline unsigned int skb_padding(struct sk_buff *skb)
@@ -246,46 +223,6 @@ static inline bool skb_encrypt(struct sk_buff *skb, struct noise_keypair *keypai
 	return chacha20poly1305_encrypt_sg(sg, sg, plaintext_len, NULL, 0, PACKET_CB(skb)->nonce, keypair->sending.key, have_simd);
 }
 
-void packet_encryption_worker(struct work_struct *work)
-{
-	bool have_simd;
-	int processed = 0;
-	struct sk_buff *next, *skb;
-	struct wireguard_peer *peer = container_of(work, struct percpu_work, work)->peer;
-
-	if (!(skb = claim_first_packet(&peer->tx_packet_queue, PACKET_TX_INITIALIZED)))
-		return;
-	have_simd = chacha20poly1305_init_simd();
-	while (skb && ++processed <= MAX_QUEUE_WORK) {
-		bool success = false;
-
-		if (unlikely(!skb_encrypt(skb, PACKET_CB(skb)->keypair, have_simd))) {
-			net_dbg_ratelimited("%s: encrypt failed!!!! skb = %p\n", netdev_pub(peer->device)->name, skb);
-			goto finished;
-		}
-		skb_reset(skb);
-		noise_keypair_put(PACKET_CB(skb)->keypair);
-		success = true;
-
-finished:
-		/* Acquire the next packet before releasing this one to avoid locking list traversal. */
-		next = claim_next_packet(&peer->tx_packet_queue, skb, PACKET_TX_INITIALIZED);
-		release_packet(skb, success);
-		skb = next;
-	}
-	chacha20poly1305_deinit_simd(have_simd);
-
-	queue_work(peer->device->crypt_wq, &peer->packet_transmit_work);
-	if (skb) {
-		int cpu = get_cpu();
-
-		release_packet(skb, false);
-		/* If there were packets left on the queue, enqueue myself to finish the work. */
-		queue_work_on(cpu, peer->device->crypt_wq, per_cpu_ptr(&peer->packet_encrypt_work->work, cpu));
-		put_cpu();
-	}
-}
-
 static inline bool get_encryption_nonce(u64 *nonce, struct noise_symmetric_key *key)
 {
 	if (unlikely(!key))
@@ -305,30 +242,112 @@ static inline bool get_encryption_nonce(u64 *nonce, struct noise_symmetric_key *
 	return true;
 }
 
-void packet_initialization_worker(struct work_struct *work)
+void packet_transmission_worker(struct work_struct *work)
 {
-	int cpu;
-	int processed = 0;
 	struct sk_buff *next, *skb;
+	struct wireguard_peer *peer = container_of(work, struct wireguard_peer, packet_transmit_work);
+
+	while ((skb = dequeue_packets(&peer->tx_packet_queue, PACKET_TX_ENCRYPTED))) {
+		bool data_sent = false;
+
+		timers_any_authenticated_packet_traversal(peer);
+		do {
+			bool is_keepalive = skb->len == message_data_len(0);
+			struct timespec now;
+
+			next = skb->next;
+			getnstimeofday(&now);
+			update_send_delay_stats(peer, timespec_sub(now, PACKET_CB(skb)->ts));
+			if (likely(!socket_send_skb_to_peer(peer, skb, PACKET_CB(skb)->ds) && !is_keepalive))
+				data_sent = true;
+		} while ((skb = next) != NULL);
+
+		if (likely(data_sent))
+			timers_data_sent(peer);
+	}
+	keep_key_fresh(peer);
+
+	/* If there's more work for this stage, enqueue it again. */
+	if (atomic_read(&peer->tx_packet_queue.encrypted_packets)) {
+		int cpu = get_cpu();
+		queue_work_on(cpu, peer->device->crypt_wq, &peer->packet_transmit_work);
+		put_cpu();
+	}
+}
+
+void packet_encryption_worker(struct work_struct *work)
+{
+	bool have_simd;
+	int processed = 0;
+	struct sk_buff *next = NULL, *skb;
+	struct wireguard_peer *peer = container_of(work, struct percpu_work, work)->peer;
+
+	have_simd = chacha20poly1305_init_simd();
+	/* Keep going until we've run out of packets, or we've done the maximum amout of work. */
+	while (processed < MAX_QUEUE_WORK) {
+		bool success = false;
+
+		/* If we have already claimed a packet, work on that one. Otherwise, start looking
+		 * for work at the beginning of the list. */
+		if (!(skb = next ? next : claim_first_packet(&peer->tx_packet_queue, PACKET_TX_INITIALIZED)))
+			break;
+
+		if (unlikely(!skb_encrypt(skb, PACKET_CB(skb)->keypair, have_simd))) {
+			net_dbg_ratelimited("%s: encrypt failed!!!! skb = %p\n", netdev_pub(peer->device)->name, skb);
+			goto finished;
+		}
+		skb_reset(skb);
+		noise_keypair_put(PACKET_CB(skb)->keypair);
+		success = true;
+
+finished:
+		/* Acquire the next packet before releasing this one to avoid needing to lock during
+		 * list traversal, but only if we're going to iterate again. */
+		if (unlikely(++processed == MAX_QUEUE_WORK))
+			next = NULL;
+		else
+			next = claim_next_packet(&peer->tx_packet_queue, skb, PACKET_TX_INITIALIZED);
+		release_packet(&peer->tx_packet_queue, skb, success);
+	}
+	chacha20poly1305_deinit_simd(have_simd);
+
+	/* Queue the next stage of work. */
+	if (processed > 0)
+		queue_work_on(next_cpu(&peer->tx_packet_queue.next_transmit_cpu), peer->device->crypt_wq, &peer->packet_transmit_work);
+
+	/* If there's more work for this stage, enqueue it as well. */
+	if (atomic_read(&peer->tx_packet_queue.initialized_packets)) {
+		int cpu = get_cpu();
+		queue_work_on(cpu, peer->device->crypt_wq, per_cpu_ptr(&peer->packet_encrypt_work->work, cpu));
+		put_cpu();
+	}
+}
+
+void packet_init_worker(struct work_struct *work)
+{
+	int processed = 0;
+	struct sk_buff *next = NULL, *skb;
 	struct wireguard_peer *peer = container_of(work, struct wireguard_peer, packet_init_work);
 
-	if (!(skb = claim_first_packet(&peer->tx_packet_queue, PACKET_TX_NEW)))
-		return;
-	while (skb && ++processed <= MAX_QUEUE_WORK) {
+	/* Keep going until we've run out of packets, or we've done the maximum amout of work. */
+	while (processed < MAX_QUEUE_WORK) {
 		bool success = false;
 		struct noise_keypair *keypair;
+
+		/* If we have already claimed a packet, work on that one. Otherwise, start looking
+		 * for work at the beginning of the list. */
+		if (!(skb = next ? next : claim_first_packet(&peer->tx_packet_queue, PACKET_TX_NEW)))
+			break;
 
 		rcu_read_lock_bh();
 		keypair = noise_keypair_get(rcu_dereference_bh(peer->keypairs.current_keypair));
 		rcu_read_unlock_bh();
 
 		if (unlikely(!keypair)) {
-			net_dbg_ratelimited("%s: no keypair!!!! skb = %p\n", netdev_pub(peer->device)->name, skb);
 			packet_queue_handshake_initiation(peer, false);
 			goto finished;
 		}
 		if (unlikely(!get_encryption_nonce(&PACKET_CB(skb)->nonce, &keypair->sending))) {
-			net_dbg_ratelimited("%s: adding nonce failed!!!! skb = %p\n", netdev_pub(peer->device)->name, skb);
 			noise_keypair_put(keypair);
 			goto finished;
 		}
@@ -336,33 +355,43 @@ void packet_initialization_worker(struct work_struct *work)
 		success = true;
 
 finished:
-		/* Acquire the next packet before releasing this one to avoid locking list traversal. */
-		next = claim_next_packet(&peer->tx_packet_queue, skb, PACKET_TX_NEW);
-		release_packet(skb, success);
-		skb = next;
+		/* Acquire the next packet before releasing this one to avoid needing to lock during
+		 * list traversal, but only if we're going to iterate again. */
+		if (unlikely(++processed == MAX_QUEUE_WORK))
+			next = NULL;
+		else
+			next = claim_next_packet(&peer->tx_packet_queue, skb, PACKET_TX_NEW);
+		release_packet(&peer->tx_packet_queue, skb, success);
 	}
 
-	for_each_online_cpu(cpu) {
-		queue_work_on(cpu, peer->device->crypt_wq, per_cpu_ptr(&peer->packet_encrypt_work->work, cpu));
+	/* Queue the next stage of work. */
+	if (processed > 0) {
+		int cpus;
+
+		for (cpus = 0; cpus < processed && cpus < cpumask_weight(cpu_online_mask); cpus += 1) {
+			int cpu = next_cpu(&peer->tx_packet_queue.next_encrypt_cpu);
+			queue_work_on(cpu, peer->device->crypt_wq, per_cpu_ptr(&peer->packet_encrypt_work->work, cpu));
+		}
 	}
-	if (skb) {
-		release_packet(skb, false);
-		/* If there were packets left on the queue, enqueue myself to finish the work. */
-		queue_work(peer->device->crypt_wq, &peer->packet_init_work);
+
+	/* If there's more work for this stage, enqueue it as well. */
+	if (atomic_read(&peer->tx_packet_queue.new_packets)) {
+		int cpu = get_cpu();
+		queue_work_on(cpu, peer->device->crypt_wq, &peer->packet_init_work);
+		put_cpu();
 	}
 }
 
 void packet_send_queue(struct wireguard_peer *peer)
 {
-	int cpu;
+	int cpus;
 
-	if (unlikely(skb_queue_empty(&peer->tx_packet_queue)))
-		return;
-
-	/* We don't know what state the queued packets are in, so try everything. */
-	queue_work(peer->device->crypt_wq, &peer->packet_init_work);
-	for_each_online_cpu(cpu) {
+	if (atomic_read(&peer->tx_packet_queue.new_packets))
+		queue_work_on(next_cpu(&peer->tx_packet_queue.next_init_cpu), peer->device->crypt_wq, &peer->packet_init_work);
+	for (cpus = 0; cpus < atomic_read(&peer->tx_packet_queue.initialized_packets) && cpus < cpumask_weight(cpu_online_mask); cpus += 1) {
+		int cpu = next_cpu(&peer->tx_packet_queue.next_encrypt_cpu);
 		queue_work_on(cpu, peer->device->crypt_wq, per_cpu_ptr(&peer->packet_encrypt_work->work, cpu));
 	}
-	queue_work(peer->device->crypt_wq, &peer->packet_transmit_work);
+	if (atomic_read(&peer->tx_packet_queue.encrypted_packets))
+		queue_work_on(next_cpu(&peer->tx_packet_queue.next_transmit_cpu), peer->device->crypt_wq, &peer->packet_transmit_work);
 }

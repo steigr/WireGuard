@@ -38,7 +38,7 @@ void packet_send_handshake_response(struct wireguard_peer *peer);
 void packet_send_handshake_cookie(struct wireguard_device *wg, struct sk_buff *initiating_skb, __le32 sender_index);
 
 void packet_encryption_worker(struct work_struct *work);
-void packet_initialization_worker(struct work_struct *work);
+void packet_init_worker(struct work_struct *work);
 void packet_transmission_worker(struct work_struct *work);
 
 /* data.c */

@@ -3,8 +3,9 @@
 #ifndef PEER_H
 #define PEER_H
 
-#include "noise.h"
 #include "cookie.h"
+#include "noise.h"
+#include "queue.h"
 
 #include <linux/types.h>
 #include <linux/netfilter.h>
@@ -51,7 +52,7 @@ struct wireguard_peer {
 	bool timer_need_another_keepalive;
 	bool sent_lastminute_handshake;
 	struct timeval walltime_last_handshake;
-	struct sk_buff_head tx_packet_queue;
+	struct wireguard_queue tx_packet_queue;
 	struct kref refcount;
 	struct rcu_head rcu;
 	struct list_head peer_list;
