@@ -289,7 +289,7 @@ void packet_encryption_worker(struct work_struct *work)
 
 		/* If we have already claimed a packet, work on that one. Otherwise, start looking
 		 * for work at the beginning of the list. */
-		if (!(skb = next ? next : claim_first_packet(&peer->tx_packet_queue, PACKET_TX_INITIALIZED)))
+		if (IS_ERR(skb = next ? next : claim_first_packet(&peer->tx_packet_queue, PACKET_TX_INITIALIZED)))
 			break;
 
 		if (unlikely(!skb_encrypt(skb, PACKET_CB(skb)->keypair, have_simd))) {
@@ -304,7 +304,7 @@ finished:
 		/* Acquire the next packet before releasing this one to avoid needing to lock during
 		 * list traversal, but only if we're going to iterate again. */
 		if (unlikely(++processed == MAX_QUEUE_WORK))
-			next = NULL;
+			next = ERR_PTR(-EAGAIN);
 		else
 			next = claim_next_packet(&peer->tx_packet_queue, skb, PACKET_TX_INITIALIZED);
 		release_packet(&peer->tx_packet_queue, skb, success);
@@ -336,7 +336,7 @@ void packet_init_worker(struct work_struct *work)
 
 		/* If we have already claimed a packet, work on that one. Otherwise, start looking
 		 * for work at the beginning of the list. */
-		if (!(skb = next ? next : claim_first_packet(&peer->tx_packet_queue, PACKET_TX_NEW)))
+		if (IS_ERR(skb = next ? next : claim_first_packet(&peer->tx_packet_queue, PACKET_TX_NEW)))
 			break;
 
 		rcu_read_lock_bh();
@@ -358,7 +358,7 @@ finished:
 		/* Acquire the next packet before releasing this one to avoid needing to lock during
 		 * list traversal, but only if we're going to iterate again. */
 		if (unlikely(++processed == MAX_QUEUE_WORK))
-			next = NULL;
+			next = ERR_PTR(-EAGAIN);
 		else
 			next = claim_next_packet(&peer->tx_packet_queue, skb, PACKET_TX_NEW);
 		release_packet(&peer->tx_packet_queue, skb, success);

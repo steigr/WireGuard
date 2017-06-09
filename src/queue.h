@@ -65,7 +65,7 @@ static inline struct sk_buff *claim_first_packet(struct wireguard_queue *queue,
 	}
 	spin_unlock_bh(&queue->head.lock);
 
-	return NULL;
+	return ERR_PTR(-ENOENT);
 }
 
 /**
@@ -83,7 +83,7 @@ static inline struct sk_buff *claim_next_packet(struct wireguard_queue *queue,
 		}
 	}
 
-	return NULL;
+	return ERR_PTR(-ENOENT);
 }
 
 static inline void release_packet(struct wireguard_queue *queue,
