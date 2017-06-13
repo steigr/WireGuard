@@ -328,6 +328,7 @@ fail:
 			spin_lock_bh(&peer->device->tx_superqueue_lock);
 			/* Retry it when the handshake comes back. */
 			ctx->state = PACKET_TX_NEW;
+			break;
 		}
 	}
 	spin_unlock_bh(&peer->device->tx_superqueue_lock);
