@@ -268,8 +268,7 @@ void encrypt_packet_worker(struct work_struct *work)
 	struct encryption_ctx *ctx = container_of(work, struct encryption_ctx, work);
 	struct sk_buff *skb, *tmp;
 
-	/* We might get queued again while executing! */
-	if (ctx->state == PACKET_TX_ENCRYPTED)
+	if(WARN_ON(ctx->state != PACKET_TX_INITED))
 		return;
 
 	/* Is ctx->state even necessary here? */
@@ -289,9 +288,6 @@ void encrypt_packet_worker(struct work_struct *work)
 	WRITE_ONCE(ctx->state, PACKET_TX_ENCRYPTED);
 
 	queue_work(ctx->peer->device->crypt_wq, &ctx->peer->transmit_packet_work);
-
-	/* We might get queued again while executing! */
-	cancel_work(work);
 }
 
 void init_packet_worker(struct work_struct *work)
