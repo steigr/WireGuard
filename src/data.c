@@ -306,6 +306,7 @@ void init_packet_worker(struct work_struct *work)
 			ctx->keypair = noise_keypair_get(rcu_dereference_bh(peer->keypairs.current_keypair));
 			rcu_read_unlock_bh();
 			if (unlikely(!ctx->keypair)) {
+				net_dbg_ratelimited("%s: No key for peer %Lu (%pISpfsc), so start a handshake!\n", netdev_pub(peer->device)->name, peer->internal_id, &peer->endpoint.addr);
 				packet_queue_handshake_initiation(peer, false);
 				goto fail;
 			}

@@ -128,6 +128,7 @@ void packet_send_keepalive(struct wireguard_peer *peer)
 	struct sk_buff_head queue;
 
 	if (peer_has_queued_packets(peer)) {
+		net_dbg_ratelimited("%s: Not sending keepalive; packets pending for peer %Lu (%pISpfsc)\n", netdev_pub(peer->device)->name, peer->internal_id, &peer->endpoint.addr);
 		queue_work(peer->device->crypt_wq, &peer->init_packet_work);
 	} else {
 		skb = alloc_skb(DATA_PACKET_HEAD_ROOM + MESSAGE_MINIMUM_LENGTH, GFP_ATOMIC);
