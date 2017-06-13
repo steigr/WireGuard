@@ -30,25 +30,18 @@ struct decryption_ctx {
 };
 
 #ifdef CONFIG_WIREGUARD_PARALLEL
-static struct kmem_cache *encryption_ctx_cache __read_mostly;
 static struct kmem_cache *decryption_ctx_cache __read_mostly;
 
 int packet_init_data_caches(void)
 {
-	encryption_ctx_cache = kmem_cache_create("wireguard_encryption_ctx", sizeof(struct encryption_ctx), 0, 0, NULL);
-	if (!encryption_ctx_cache)
-		return -ENOMEM;
 	decryption_ctx_cache = kmem_cache_create("wireguard_decryption_ctx", sizeof(struct decryption_ctx), 0, 0, NULL);
-	if (!decryption_ctx_cache) {
-		kmem_cache_destroy(encryption_ctx_cache);
+	if (!decryption_ctx_cache)
 		return -ENOMEM;
-	}
 	return 0;
 }
 
 void packet_deinit_data_caches(void)
 {
-	kmem_cache_destroy(encryption_ctx_cache);
 	kmem_cache_destroy(decryption_ctx_cache);
 }
 #endif
@@ -231,28 +224,6 @@ static inline void queue_encrypt_reset(struct sk_buff_head *queue, struct noise_
 }
 
 #ifdef CONFIG_WIREGUARD_PARALLEL
-static void begin_parallel_encryption(struct padata_priv *padata)
-{
-	struct encryption_ctx *ctx = container_of(padata, struct encryption_ctx, padata);
-#if IS_ENABLED(CONFIG_KERNEL_MODE_NEON) && defined(CONFIG_ARM)
-	local_bh_enable();
-#endif
-	queue_encrypt_reset(&ctx->queue, ctx->keypair);
-#if IS_ENABLED(CONFIG_KERNEL_MODE_NEON) && defined(CONFIG_ARM)
-	local_bh_disable();
-#endif
-	padata_do_serial(padata);
-}
-
-static void finish_parallel_encryption(struct padata_priv *padata)
-{
-	struct encryption_ctx *ctx = container_of(padata, struct encryption_ctx, padata);
-	packet_create_data_done(&ctx->queue, ctx->peer);
-	atomic_dec(&ctx->peer->parallel_encryption_inflight);
-	peer_put(ctx->peer);
-	kmem_cache_free(encryption_ctx_cache, ctx);
-}
-
 static inline unsigned int choose_cpu(__le32 key)
 {
 	unsigned int cpu_index, cpu, cb_cpu;
@@ -275,9 +246,9 @@ int packet_create_data(struct sk_buff_head *queue, struct wireguard_peer *peer)
 
 	rcu_read_lock_bh();
 	keypair = noise_keypair_get(rcu_dereference_bh(peer->keypairs.current_keypair));
-	if (unlikely(!keypair))
-		goto err_rcu;
 	rcu_read_unlock_bh();
+	if (unlikely(!keypair))
+		return ret;
 
 	skb_queue_walk (queue, skb) {
 		if (unlikely(!get_encryption_nonce(&PACKET_CB(skb)->nonce, &keypair->sending)))
@@ -292,44 +263,12 @@ int packet_create_data(struct sk_buff_head *queue, struct wireguard_peer *peer)
 		ret = -EPIPE;
 	}
 
-#ifdef CONFIG_WIREGUARD_PARALLEL
-	if ((skb_queue_len(queue) > 1 || queue->next->len > 256 || atomic_read(&peer->parallel_encryption_inflight) > 0) && cpumask_weight(cpu_online_mask) > 1) {
-		struct encryption_ctx *ctx = kmem_cache_alloc(encryption_ctx_cache, GFP_ATOMIC);
-		if (!ctx)
-			goto serial_encrypt;
-		skb_queue_head_init(&ctx->queue);
-		skb_queue_splice_init(queue, &ctx->queue);
-		memset(&ctx->padata, 0, sizeof(ctx->padata));
-		ctx->padata.parallel = begin_parallel_encryption;
-		ctx->padata.serial = finish_parallel_encryption;
-		ctx->keypair = keypair;
-		ctx->peer = peer_rcu_get(peer);
-		ret = -EBUSY;
-		if (unlikely(!ctx->peer))
-			goto err_parallel;
-		atomic_inc(&peer->parallel_encryption_inflight);
-		if (unlikely(padata_do_parallel(peer->device->encrypt_pd, &ctx->padata, choose_cpu(keypair->remote_index)))) {
-			atomic_dec(&peer->parallel_encryption_inflight);
-			peer_put(ctx->peer);
-err_parallel:
-			skb_queue_splice(&ctx->queue, queue);
-			kmem_cache_free(encryption_ctx_cache, ctx);
-			goto err;
-		}
-	} else
-serial_encrypt:
-#endif
-	{
-		queue_encrypt_reset(queue, keypair);
-		packet_create_data_done(queue, peer);
-	}
+	queue_encrypt_reset(queue, keypair);
+	packet_create_data_done(queue, peer);
 	return 0;
 
 err:
 	noise_keypair_put(keypair);
-	return ret;
-err_rcu:
-	rcu_read_unlock_bh();
 	return ret;
 }
 

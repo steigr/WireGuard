@@ -44,7 +44,7 @@ struct wireguard_device {
 #endif
 #ifdef CONFIG_WIREGUARD_PARALLEL
 	struct workqueue_struct *crypt_wq;
-	struct padata_instance *encrypt_pd, *decrypt_pd;
+	struct padata_instance *decrypt_pd;
 #endif
 	atomic64_t mean_send_delay;
 	atomic64_t sent_packets;
