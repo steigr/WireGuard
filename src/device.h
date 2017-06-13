@@ -42,8 +42,8 @@ struct wireguard_device {
 #ifdef CONFIG_PM_SLEEP
 	struct notifier_block clear_peers_on_suspend;
 #endif
-#ifdef CONFIG_WIREGUARD_PARALLEL
 	struct workqueue_struct *crypt_wq;
+#ifdef CONFIG_WIREGUARD_PARALLEL
 	struct padata_instance *decrypt_pd;
 #endif
 	atomic64_t mean_send_delay;
