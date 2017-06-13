@@ -22,6 +22,11 @@ struct handshake_worker {
 	struct work_struct work;
 };
 
+struct per_cpu_work {
+	struct wireguard_device *wg;
+	struct work_struct work;
+};
+
 struct wireguard_device {
 	struct sock __rcu *sock4, *sock6;
 	u16 incoming_port;
@@ -50,6 +55,8 @@ struct wireguard_device {
 	atomic64_t sent_packets;
 	struct list_head tx_superqueue;
 	spinlock_t tx_superqueue_lock;
+	struct per_cpu_work __percpu *encrypt_packet_work;
+	int next_encryption_cpu;
 };
 
 int device_init(void);

@@ -201,7 +201,6 @@ static inline bool get_encryption_nonce(u64 *nonce, struct noise_symmetric_key *
 	return true;
 }
 
-#ifdef CONFIG_WIREGUARD_PARALLEL
 static inline unsigned int choose_cpu(__le32 key)
 {
 	unsigned int cpu_index, cpu, cb_cpu;
@@ -214,7 +213,6 @@ static inline unsigned int choose_cpu(__le32 key)
 
 	return cb_cpu;
 }
-#endif
 
 void transmit_packet_worker(struct work_struct *work)
 {
@@ -228,6 +226,10 @@ void transmit_packet_worker(struct work_struct *work)
 		if (ctx->peer == peer && ctx->state == PACKET_TX_ENCRYPTED) {
 			ctx->state = PACKET_TX_SENDING;
 			spin_unlock_bh(&peer->device->tx_superqueue_lock);
+
+			/* Can't do this in encrypt_packet_worker because ctx might get freed before
+			 * queue_work_on returns. */
+			noise_keypair_put(ctx->keypair);
 
 			/* This can only happen if skb_encrypt fails for an entire subqueue. */
 			if (WARN_ON(!skb_queue_len(&ctx->queue)))
@@ -261,37 +263,55 @@ done:
 	spin_unlock_bh(&peer->device->tx_superqueue_lock);
 }
 
-
 void encrypt_packet_worker(struct work_struct *work)
 {
 	bool have_simd;
-	struct encryption_ctx *ctx = container_of(work, struct encryption_ctx, work);
+	struct encryption_ctx *ctx;
 	struct sk_buff *skb, *tmp;
+	struct wireguard_device *wg = container_of(work, struct per_cpu_work, work)->wg;
 
-	if(WARN_ON(ctx->state != PACKET_TX_INITED))
-		return;
+	spin_lock_bh(&wg->tx_superqueue_lock);
+	list_for_each_entry(ctx, &wg->tx_superqueue, list) {
+		if (ctx->state == PACKET_TX_INITED) {
+			ctx->state = PACKET_TX_ENCRYPTING;
+			spin_unlock_bh(&wg->tx_superqueue_lock);
 
-	/* Is ctx->state even necessary here? */
-	WRITE_ONCE(ctx->state, PACKET_TX_ENCRYPTING);
-	have_simd = chacha20poly1305_init_simd();
-	skb_queue_walk_safe (&ctx->queue, skb, tmp) {
-		if (unlikely(!skb_encrypt(skb, ctx->keypair, have_simd))) {
-			/* FIXME: dropping packets??? */
-			__skb_unlink(skb, &ctx->queue);
-			kfree_skb(skb);
-			continue;
+			have_simd = chacha20poly1305_init_simd();
+			skb_queue_walk_safe (&ctx->queue, skb, tmp) {
+				if (unlikely(!skb_encrypt(skb, ctx->keypair, have_simd))) {
+					/* FIXME: dropping packets??? */
+					__skb_unlink(skb, &ctx->queue);
+					kfree_skb(skb);
+					continue;
+				}
+				skb_reset(skb);
+			}
+			chacha20poly1305_deinit_simd(have_simd);
+
+			spin_lock_bh(&wg->tx_superqueue_lock);
+			/* Forward progress */
+			ctx->state = PACKET_TX_ENCRYPTED;
+			queue_work_on(choose_cpu(ctx->keypair->remote_index), ctx->peer->device->crypt_wq, &ctx->peer->transmit_packet_work);
 		}
-		skb_reset(skb);
 	}
-	chacha20poly1305_deinit_simd(have_simd);
-	noise_keypair_put(ctx->keypair);
-	WRITE_ONCE(ctx->state, PACKET_TX_ENCRYPTED);
+	spin_unlock_bh(&wg->tx_superqueue_lock);
+}
 
-	queue_work(ctx->peer->device->crypt_wq, &ctx->peer->transmit_packet_work);
+static inline int next_encryption_cpu(struct wireguard_device *wg)
+{
+	int cpu;
+
+	cpu = wg->next_encryption_cpu;
+	if (cpu >= nr_cpumask_bits || !cpumask_test_cpu(cpu, cpu_online_mask))
+		cpu = cpumask_first(cpu_online_mask);
+	wg->next_encryption_cpu = cpumask_next(cpu, cpu_online_mask);
+
+	return cpu;
 }
 
 void init_packet_worker(struct work_struct *work)
 {
+	int cpu;
 	struct encryption_ctx *ctx;
 	struct sk_buff *skb;
 	struct wireguard_peer *peer = container_of(work, struct wireguard_peer, init_packet_work);
@@ -320,7 +340,8 @@ void init_packet_worker(struct work_struct *work)
 			spin_lock_bh(&peer->device->tx_superqueue_lock);
 			/* Forward progress */
 			ctx->state = PACKET_TX_INITED;
-			queue_work(peer->device->crypt_wq, &ctx->work);
+			cpu = next_encryption_cpu(peer->device);
+			queue_work_on(cpu, peer->device->crypt_wq, &per_cpu_ptr(peer->device->encrypt_packet_work, cpu)->work);
 			continue;
 
 fail_keypair:
@@ -350,7 +371,6 @@ int packet_enqueue_list(struct wireguard_peer *peer, struct sk_buff_head *queue)
 	__skb_queue_head_init(&ctx->queue);
 	skb_queue_splice(queue, &ctx->queue);
 	ctx->state = PACKET_TX_NEW;
-	INIT_WORK(&ctx->work, encrypt_packet_worker);
 
 	spin_lock_bh(&peer->device->tx_superqueue_lock);
 	list_add_tail(&ctx->list, &peer->device->tx_superqueue);

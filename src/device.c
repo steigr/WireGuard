@@ -329,6 +329,14 @@ static int newlink(struct net *src_net, struct net_device *dev, struct nlattr *t
 	if (!wg->crypt_wq)
 		goto error_5;
 
+	wg->encrypt_packet_work = alloc_percpu(struct per_cpu_work);
+	if (!wg->encrypt_packet_work)
+		goto error_6;
+	for_each_possible_cpu (cpu) {
+		per_cpu_ptr(wg->encrypt_packet_work, cpu)->wg = wg;
+		INIT_WORK(&per_cpu_ptr(wg->encrypt_packet_work, cpu)->work, encrypt_packet_worker);
+	}
+
 #ifdef CONFIG_WIREGUARD_PARALLEL
 	wg->decrypt_pd = padata_alloc_possible(wg->crypt_wq);
 	if (!wg->decrypt_pd)
@@ -366,6 +374,8 @@ error_8:
 	padata_free(wg->decrypt_pd);
 error_7:
 #endif
+	free_percpu(wg->encrypt_packet_work);
+error_6:
 	destroy_workqueue(wg->crypt_wq);
 error_5:
 	destroy_workqueue(wg->peer_wq);

@@ -20,7 +20,6 @@ struct encryption_ctx {
 	u8 state;
 	struct noise_keypair *keypair;
 	struct sk_buff_head queue;
-	struct work_struct work;
 };
 
 struct packet_cb {
@@ -54,6 +53,7 @@ void send_keep_key_fresh(struct wireguard_peer *peer);
 
 /* data.c */
 void init_packet_worker(struct work_struct *work);
+void encrypt_packet_worker(struct work_struct *work);
 void transmit_packet_worker(struct work_struct *work);
 int packet_enqueue_list(struct wireguard_peer *peer, struct sk_buff_head *queue);
 void packet_consume_data(struct sk_buff *skb, struct wireguard_device *wg);
