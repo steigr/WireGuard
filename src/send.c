@@ -115,6 +115,7 @@ void packet_send_keepalive(struct wireguard_peer *peer)
 			return;
 		skb_reserve(skb, DATA_PACKET_HEAD_ROOM);
 		skb->dev = netdev_pub(peer->device);
+		getnstimeofday(&PACKET_CB(skb)->ts);
 		skb_queue_tail(&peer->tx_packet_queue, skb);
 		net_dbg_ratelimited("%s: Sending keepalive packet to peer %Lu (%pISpfsc)\n", netdev_pub(peer->device)->name, peer->internal_id, &peer->endpoint.addr);
 	}

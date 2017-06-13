@@ -46,6 +46,8 @@ struct wireguard_device {
 	struct workqueue_struct *crypt_wq;
 	struct padata_instance *encrypt_pd, *decrypt_pd;
 #endif
+	atomic64_t mean_send_delay;
+	atomic64_t sent_packets;
 };
 
 int device_init(void);

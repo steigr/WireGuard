@@ -15,6 +15,7 @@ struct wireguard_peer;
 struct sk_buff;
 
 struct packet_cb {
+	struct timespec ts;
 	u64 nonce;
 	u8 ds;
 };

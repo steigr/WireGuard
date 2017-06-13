@@ -146,10 +146,31 @@ out:
 #endif
 }
 
+static inline void update_send_delay_stats(struct wireguard_peer *peer, struct timespec delay)
+{
+	s64 delay_ns = timespec_to_ns(&delay), mean_delay, new_delay;
+
+	if (delay_ns <= 0)
+		return;
+retry:
+	mean_delay = atomic64_read(&peer->device->mean_send_delay);
+	/* Take care to compensate for integer division. */
+	new_delay = ((mean_delay + 500) * 999 + delay_ns) / 1000;
+	if (atomic64_cmpxchg(&peer->device->mean_send_delay, mean_delay, new_delay) != mean_delay)
+		goto retry;
+	if (atomic64_inc_return(&peer->device->sent_packets) % 100000 == 0)
+		net_dbg_ratelimited("%s: Mean delay is %lld ns\n", netdev_pub(peer->device)->name, new_delay);
+}
+
+
 int socket_send_skb_to_peer(struct wireguard_peer *peer, struct sk_buff *skb, u8 ds)
 {
 	size_t skb_len = skb->len;
+	struct timespec now;
 	int ret = -EAFNOSUPPORT;
+
+	getnstimeofday(&now);
+	update_send_delay_stats(peer, timespec_sub(now, PACKET_CB(skb)->ts));
 
 	read_lock_bh(&peer->endpoint_lock);
 	if (peer->endpoint.addr.sa_family == AF_INET)

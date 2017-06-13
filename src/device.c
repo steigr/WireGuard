@@ -185,6 +185,7 @@ static netdev_tx_t xmit(struct sk_buff *skb, struct net_device *dev)
 		 * so at this point we're in a position to drop it. */
 		skb_dst_drop(skb);
 
+		getnstimeofday(&PACKET_CB(skb)->ts);
 		skb_queue_tail(&peer->tx_packet_queue, skb);
 	} while ((skb = next) != NULL);
 
