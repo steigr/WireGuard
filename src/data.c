@@ -253,6 +253,9 @@ done:
 			list_del(&ctx->list);
 			kfree(ctx);
 			ctx = prev;
+		} else if (ctx->peer == peer) {
+			/* Don't traverse past the first non-encrypted packet. */
+			break;
 		}
 	}
 	spin_unlock_bh(&peer->device->tx_superqueue_lock);
