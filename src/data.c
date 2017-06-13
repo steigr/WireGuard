@@ -358,7 +358,9 @@ fail:
 
 int packet_enqueue_list(struct wireguard_peer *peer, struct sk_buff_head *queue)
 {
+	u8 state;
 	struct encryption_ctx *ctx;
+	struct sk_buff *skb;
 
 	if (WARN_ON(!skb_queue_len(queue)))
 		return 0;
@@ -370,13 +372,35 @@ int packet_enqueue_list(struct wireguard_peer *peer, struct sk_buff_head *queue)
 	ctx->peer = peer;
 	__skb_queue_head_init(&ctx->queue);
 	skb_queue_splice(queue, &ctx->queue);
-	ctx->state = PACKET_TX_NEW;
+
+	rcu_read_lock_bh();
+	ctx->keypair = noise_keypair_get(rcu_dereference_bh(peer->keypairs.current_keypair));
+	rcu_read_unlock_bh();
+	if (likely(ctx->keypair)) {
+		skb_queue_walk (&ctx->queue, skb) {
+			if (unlikely(!get_encryption_nonce(&PACKET_CB(skb)->nonce, &ctx->keypair->sending))) {
+				noise_keypair_put(ctx->keypair);
+				goto fail;
+			}
+		}
+		ctx->state = PACKET_TX_INITED;
+	} else {
+fail:
+		packet_queue_handshake_initiation(peer, false);
+		ctx->state = PACKET_TX_NEW;
+	}
+	state = ctx->state;
 
 	spin_lock_bh(&peer->device->tx_superqueue_lock);
 	list_add_tail(&ctx->list, &peer->device->tx_superqueue);
 	spin_unlock_bh(&peer->device->tx_superqueue_lock);
 
-	queue_work(peer->device->crypt_wq, &peer->init_packet_work);
+	if (state == PACKET_TX_INITED) {
+		int cpu = next_encryption_cpu(peer->device);
+		queue_work_on(cpu, peer->device->crypt_wq, &per_cpu_ptr(peer->device->encrypt_packet_work, cpu)->work);
+	} else {
+		queue_work(peer->device->crypt_wq, &peer->init_packet_work);
+	}
 
 	return 0;
 }
