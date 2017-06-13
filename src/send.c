@@ -89,7 +89,7 @@ void packet_send_handshake_cookie(struct wireguard_device *wg, struct sk_buff *i
 	socket_send_buffer_as_reply_to_skb(wg, initiating_skb, &packet, sizeof(packet));
 }
 
-static inline void keep_key_fresh(struct wireguard_peer *peer)
+void send_keep_key_fresh(struct wireguard_peer *peer)
 {
 	struct noise_keypair *keypair;
 	bool send = false;
@@ -106,93 +106,41 @@ static inline void keep_key_fresh(struct wireguard_peer *peer)
 		packet_queue_handshake_initiation(peer, false);
 }
 
+static inline bool peer_has_queued_packets(struct wireguard_peer *peer)
+{
+	struct encryption_ctx *ctx;
+
+	spin_lock_bh(&peer->device->tx_superqueue_lock);
+	list_for_each_entry(ctx, &peer->device->tx_superqueue, list) {
+		if (ctx->peer == peer) {
+			spin_unlock_bh(&peer->device->tx_superqueue_lock);
+			return true;
+		}
+	}
+	spin_unlock_bh(&peer->device->tx_superqueue_lock);
+
+	return false;
+}
+
 void packet_send_keepalive(struct wireguard_peer *peer)
 {
 	struct sk_buff *skb;
-	if (!skb_queue_len(&peer->tx_packet_queue)) {
+	struct sk_buff_head queue;
+
+	if (peer_has_queued_packets(peer)) {
+		queue_work(peer->device->crypt_wq, &peer->init_packet_work);
+	} else {
 		skb = alloc_skb(DATA_PACKET_HEAD_ROOM + MESSAGE_MINIMUM_LENGTH, GFP_ATOMIC);
 		if (unlikely(!skb))
 			return;
 		skb_reserve(skb, DATA_PACKET_HEAD_ROOM);
 		skb->dev = netdev_pub(peer->device);
 		getnstimeofday(&PACKET_CB(skb)->ts);
-		skb_queue_tail(&peer->tx_packet_queue, skb);
-		net_dbg_ratelimited("%s: Sending keepalive packet to peer %Lu (%pISpfsc)\n", netdev_pub(peer->device)->name, peer->internal_id, &peer->endpoint.addr);
-	}
-	packet_send_queue(peer);
-}
-
-void packet_create_data_done(struct sk_buff_head *queue, struct wireguard_peer *peer)
-{
-	struct sk_buff *skb, *tmp;
-	bool is_keepalive, data_sent = false;
-
-	if (unlikely(!skb_queue_len(queue)))
-		return;
-
-	timers_any_authenticated_packet_traversal(peer);
-	skb_queue_walk_safe (queue, skb, tmp) {
-		is_keepalive = skb->len == message_data_len(0);
-		if (likely(!socket_send_skb_to_peer(peer, skb, PACKET_CB(skb)->ds) && !is_keepalive))
-			data_sent = true;
-	}
-	if (likely(data_sent))
-		timers_data_sent(peer);
-
-	keep_key_fresh(peer);
-
-	if (unlikely(peer->need_resend_queue))
-		packet_send_queue(peer);
-}
-
-void packet_send_queue(struct wireguard_peer *peer)
-{
-	struct sk_buff_head queue;
-
-	peer->need_resend_queue = false;
-
-	/* Steal the current queue into our local one. */
-	skb_queue_head_init(&queue);
-	spin_lock_bh(&peer->tx_packet_queue.lock);
-	skb_queue_splice_init(&peer->tx_packet_queue, &queue);
-	spin_unlock_bh(&peer->tx_packet_queue.lock);
-
-	if (unlikely(!skb_queue_len(&queue)))
-		return;
-
-	/* We submit it for encryption and sending. */
-	switch (packet_create_data(&queue, peer)) {
-	case 0:
-		break;
-	case -EBUSY:
-		/* EBUSY happens when the parallel workers are all filled up, in which
-		 * case we should requeue everything. */
-
-		/* First, we mark that we should try to do this later, when existing
-		 * jobs are done. */
-		peer->need_resend_queue = true;
-
-		/* We stick the remaining skbs from local_queue at the top of the peer's
-		 * queue again, setting the top of local_queue to be the skb that begins
-		 * the requeueing. */
-		spin_lock_bh(&peer->tx_packet_queue.lock);
-		skb_queue_splice(&queue, &peer->tx_packet_queue);
-		spin_unlock_bh(&peer->tx_packet_queue.lock);
-		break;
-	case -ENOKEY:
-		/* ENOKEY means that we don't have a valid session for the peer, which
-		 * means we should initiate a session, but after requeuing like above. */
-
-		spin_lock_bh(&peer->tx_packet_queue.lock);
-		skb_queue_splice(&queue, &peer->tx_packet_queue);
-		spin_unlock_bh(&peer->tx_packet_queue.lock);
-
-		packet_queue_handshake_initiation(peer, false);
-		break;
-	default:
-		/* If we failed for any other reason, we want to just free the packets and
-		 * forget about them. We do this unlocked, since we're the only ones with
-		 * a reference to the local queue. */
-		__skb_queue_purge(&queue);
+		__skb_queue_head_init(&queue);
+		__skb_queue_tail(&queue, skb);
+		if (packet_enqueue_list(peer, &queue))
+			net_dbg_ratelimited("%s: Failed to send keepalive packet to peer %Lu (%pISpfsc)\n", netdev_pub(peer->device)->name, peer->internal_id, &peer->endpoint.addr);
+		else
+			net_dbg_ratelimited("%s: Sending keepalive packet to peer %Lu (%pISpfsc)\n", netdev_pub(peer->device)->name, peer->internal_id, &peer->endpoint.addr);
 	}
 }

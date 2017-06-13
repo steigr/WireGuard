@@ -215,7 +215,8 @@ void packet_consume_data_done(struct sk_buff *skb, struct wireguard_peer *peer, 
 
 	if (unlikely(used_new_key)) {
 		peer->sent_lastminute_handshake = false;
-		packet_send_queue(peer);
+		/* Replaces packet_send_queue(peer); */
+		queue_work(peer->device->crypt_wq, &peer->init_packet_work);
 		timers_handshake_complete(peer);
 	}
 

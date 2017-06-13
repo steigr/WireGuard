@@ -31,9 +31,6 @@ static void expired_retransmit_handshake(unsigned long ptr)
 		pr_debug("%s: Handshake for peer %Lu (%pISpfsc) did not complete after %d attempts, giving up\n", netdev_pub(peer->device)->name, peer->internal_id, &peer->endpoint.addr, MAX_TIMER_HANDSHAKES + 2);
 
 		del_timer(&peer->timer_send_keepalive);
-		/* We remove all existing packets and don't try again,
-		 * if we try unsuccessfully for too long to make a handshake. */
-		skb_queue_purge(&peer->tx_packet_queue);
 		/* We set a timer for destroying any residue that might be left
 		 * of a partial exchange. */
 		if (likely(peer->timers_enabled) && !timer_pending(&peer->timer_kill_ephemerals))

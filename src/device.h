@@ -48,6 +48,8 @@ struct wireguard_device {
 #endif
 	atomic64_t mean_send_delay;
 	atomic64_t sent_packets;
+	struct list_head tx_superqueue;
+	spinlock_t tx_superqueue_lock;
 };
 
 int device_init(void);

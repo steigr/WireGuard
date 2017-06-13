@@ -58,7 +58,9 @@ static int open(struct net_device *dev)
 		return ret;
 	peer_for_each (wg, peer, temp, true) {
 		timers_init_peer(peer);
-		packet_send_queue(peer);
+		/* Replaces packet_send_queue(peer); FIXME: needs checking! */
+		queue_work(peer->device->crypt_wq, &peer->init_packet_work);
+		queue_work(peer->device->crypt_wq, &peer->transmit_packet_work);
 		if (peer->persistent_keepalive_interval)
 			packet_send_keepalive(peer);
 	}
@@ -132,6 +134,7 @@ static netdev_tx_t xmit(struct sk_buff *skb, struct net_device *dev)
 	struct wireguard_device *wg = netdev_priv(dev);
 	struct wireguard_peer *peer;
 	struct sk_buff *next;
+	struct sk_buff_head queue;
 	int ret;
 
 	if (unlikely(dev_recursion_level() > 4)) {
@@ -157,14 +160,7 @@ static netdev_tx_t xmit(struct sk_buff *skb, struct net_device *dev)
 		goto err_peer;
 	}
 
-	/* If the queue is getting too big, we start removing the oldest packets until it's small again.
-	 * We do this before adding the new packet, so we don't remove GSO segments that are in excess. */
-	while (skb_queue_len(&peer->tx_packet_queue) > MAX_QUEUED_OUTGOING_PACKETS)
-		dev_kfree_skb(skb_dequeue(&peer->tx_packet_queue));
-
-	if (!skb_is_gso(skb))
-		skb->next = NULL;
-	else {
+	if (skb_is_gso(skb)) {
 		struct sk_buff *segs = skb_gso_segment(skb, 0);
 		if (unlikely(IS_ERR(segs))) {
 			ret = PTR_ERR(segs);
@@ -172,7 +168,11 @@ static netdev_tx_t xmit(struct sk_buff *skb, struct net_device *dev)
 		}
 		dev_kfree_skb(skb);
 		skb = segs;
+	} else {
+		skb->next = NULL;
 	}
+
+	__skb_queue_head_init(&queue);
 	do {
 		next = skb->next;
 		skb->next = skb->prev = NULL;
@@ -186,10 +186,12 @@ static netdev_tx_t xmit(struct sk_buff *skb, struct net_device *dev)
 		skb_dst_drop(skb);
 
 		getnstimeofday(&PACKET_CB(skb)->ts);
-		skb_queue_tail(&peer->tx_packet_queue, skb);
+		__skb_queue_tail(&queue, skb);
 	} while ((skb = next) != NULL);
 
-	packet_send_queue(peer);
+	if (packet_enqueue_list(peer, &queue))
+		goto err_peer;
+
 	peer_put(peer);
 	return NETDEV_TX_OK;
 
@@ -299,6 +301,8 @@ static int newlink(struct net *src_net, struct net_device *dev, struct nlattr *t
 	index_hashtable_init(&wg->index_hashtable);
 	routing_table_init(&wg->peer_routing_table);
 	INIT_LIST_HEAD(&wg->peer_list);
+	INIT_LIST_HEAD(&wg->tx_superqueue);
+	spin_lock_init(&wg->tx_superqueue_lock);
 
 	dev->tstats = netdev_alloc_pcpu_stats(struct pcpu_sw_netstats);
 	if (!dev->tstats)

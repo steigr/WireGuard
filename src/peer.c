@@ -41,8 +41,9 @@ struct wireguard_peer *peer_create(struct wireguard_device *wg, const u8 public_
 	cookie_checker_precompute_peer_keys(peer);
 	mutex_init(&peer->keypairs.keypair_update_lock);
 	INIT_WORK(&peer->transmit_handshake_work, packet_send_queued_handshakes);
+	INIT_WORK(&peer->init_packet_work, init_packet_worker);
+	INIT_WORK(&peer->transmit_packet_work, transmit_packet_worker);
 	rwlock_init(&peer->endpoint_lock);
-	skb_queue_head_init(&peer->tx_packet_queue);
 	kref_init(&peer->refcount);
 	pubkey_hashtable_add(&wg->peer_hashtable, peer);
 	list_add_tail(&peer->peer_list, &wg->peer_list);
@@ -74,6 +75,9 @@ void peer_remove(struct wireguard_peer *peer)
 	if (unlikely(!peer))
 		return;
 	lockdep_assert_held(&peer->device->device_update_lock);
+	/* FIXME: work is outlasting the peer! */
+	WARN_ON(work_pending(&peer->init_packet_work));
+	WARN_ON(work_pending(&peer->transmit_packet_work));
 	noise_handshake_clear(&peer->handshake);
 	noise_keypairs_clear(&peer->keypairs);
 	list_del(&peer->peer_list);
@@ -82,7 +86,6 @@ void peer_remove(struct wireguard_peer *peer)
 	pubkey_hashtable_remove(&peer->device->peer_hashtable, peer);
 	if (peer->device->peer_wq)
 		flush_workqueue(peer->device->peer_wq);
-	skb_queue_purge(&peer->tx_packet_queue);
 	peer_put(peer);
 }
 
@@ -90,7 +93,6 @@ static void rcu_release(struct rcu_head *rcu)
 {
 	struct wireguard_peer *peer = container_of(rcu, struct wireguard_peer, rcu);
 	pr_debug("%s: Peer %Lu (%pISpfsc) destroyed\n", netdev_pub(peer->device)->name, peer->internal_id, &peer->endpoint.addr);
-	skb_queue_purge(&peer->tx_packet_queue);
 	dst_cache_destroy(&peer->endpoint_cache);
 	kzfree(peer);
 }
