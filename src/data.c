@@ -207,22 +207,6 @@ static inline bool get_encryption_nonce(u64 *nonce, struct noise_symmetric_key *
 	return true;
 }
 
-static inline void queue_encrypt_reset(struct sk_buff_head *queue, struct noise_keypair *keypair)
-{
-	struct sk_buff *skb, *tmp;
-	bool have_simd = chacha20poly1305_init_simd();
-	skb_queue_walk_safe (queue, skb, tmp) {
-		if (unlikely(!skb_encrypt(skb, keypair, have_simd))) {
-			__skb_unlink(skb, queue);
-			kfree_skb(skb);
-			continue;
-		}
-		skb_reset(skb);
-	}
-	chacha20poly1305_deinit_simd(have_simd);
-	noise_keypair_put(keypair);
-}
-
 #ifdef CONFIG_WIREGUARD_PARALLEL
 static inline unsigned int choose_cpu(__le32 key)
 {
@@ -240,9 +224,10 @@ static inline unsigned int choose_cpu(__le32 key)
 
 int packet_create_data(struct sk_buff_head *queue, struct wireguard_peer *peer)
 {
+	bool have_simd;
 	int ret = -ENOKEY;
 	struct noise_keypair *keypair;
-	struct sk_buff *skb;
+	struct sk_buff *skb, *tmp;
 
 	rcu_read_lock_bh();
 	keypair = noise_keypair_get(rcu_dereference_bh(peer->keypairs.current_keypair));
@@ -263,7 +248,18 @@ int packet_create_data(struct sk_buff_head *queue, struct wireguard_peer *peer)
 		ret = -EPIPE;
 	}
 
-	queue_encrypt_reset(queue, keypair);
+	have_simd = chacha20poly1305_init_simd();
+	skb_queue_walk_safe (queue, skb, tmp) {
+		if (unlikely(!skb_encrypt(skb, keypair, have_simd))) {
+			__skb_unlink(skb, queue);
+			kfree_skb(skb);
+			continue;
+		}
+		skb_reset(skb);
+	}
+	chacha20poly1305_deinit_simd(have_simd);
+	noise_keypair_put(keypair);
+
 	packet_create_data_done(queue, peer);
 	return 0;
 
