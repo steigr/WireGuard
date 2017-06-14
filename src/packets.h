@@ -17,9 +17,9 @@ struct sk_buff;
 struct encryption_ctx {
 	struct list_head list;
 	struct wireguard_peer *peer;
-	u8 state;
 	struct noise_keypair *keypair;
 	struct sk_buff_head queue;
+	atomic_t state;
 };
 
 struct packet_cb {

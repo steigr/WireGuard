@@ -214,87 +214,144 @@ static inline unsigned int choose_cpu(__le32 key)
 	return cb_cpu;
 }
 
-void transmit_packet_worker(struct work_struct *work)
+static inline struct encryption_ctx *claim_first_ctx_any_peer(struct wireguard_device *wg,
+							      int state)
 {
-	bool data_sent;
-	struct encryption_ctx *ctx, *prev;
-	struct sk_buff *skb, *tmp;
-	struct wireguard_peer *peer = container_of(work, struct wireguard_peer, transmit_packet_work);
+	struct encryption_ctx *ctx;
+
+	spin_lock_bh(&wg->tx_superqueue_lock);
+	list_for_each_entry(ctx, &wg->tx_superqueue, list) {
+		if (atomic_cmpxchg(&ctx->state, state, state + 1) == state) {
+			spin_unlock_bh(&wg->tx_superqueue_lock);
+			return ctx;
+		}
+	}
+	spin_unlock_bh(&wg->tx_superqueue_lock);
+
+	return ERR_PTR(-ENOENT);
+}
+
+static inline struct encryption_ctx *claim_next_ctx_any_peer(struct wireguard_device *wg,
+							     struct encryption_ctx *ctx,
+							     int state)
+{
+	list_for_each_entry_continue(ctx, &wg->tx_superqueue, list) {
+		if (atomic_cmpxchg(&ctx->state, state, state + 1) == state) {
+			return ctx;
+		}
+	}
+
+	return ERR_PTR(-ENOENT);
+}
+
+static inline struct encryption_ctx *claim_first_ctx(struct wireguard_peer *peer,
+						     int state,
+						     bool no_gaps)
+{
+	struct encryption_ctx *ctx;
 
 	spin_lock_bh(&peer->device->tx_superqueue_lock);
 	list_for_each_entry(ctx, &peer->device->tx_superqueue, list) {
-		if (ctx->peer == peer && ctx->state == PACKET_TX_ENCRYPTED) {
-			ctx->state = PACKET_TX_SENDING;
+		if (ctx->peer == peer && atomic_cmpxchg(&ctx->state, state, state + 1) == state) {
 			spin_unlock_bh(&peer->device->tx_superqueue_lock);
-
-			/* Can't do this in encrypt_packet_worker because ctx might get freed before
-			 * queue_work_on returns. */
-			noise_keypair_put(ctx->keypair);
-
-			/* This can only happen if skb_encrypt fails for an entire subqueue. */
-			if (WARN_ON(!skb_queue_len(&ctx->queue)))
-				goto done;
-
-			timers_any_authenticated_packet_traversal(peer);
-			data_sent = false;
-			skb_queue_walk_safe (&ctx->queue, skb, tmp) {
-				bool is_keepalive = skb->len == message_data_len(0);
-				if (likely(!socket_send_skb_to_peer(peer, skb, PACKET_CB(skb)->ds) && !is_keepalive))
-					data_sent = true;
-			}
-			if (likely(data_sent))
-				timers_data_sent(peer);
-			send_keep_key_fresh(peer);
-
-done:
-			spin_lock_bh(&peer->device->tx_superqueue_lock);
-			/* Need to free the current item while traversing the list. We can't use
-			 * list_for_each_entry_safe because that holds a reference to a list entry
-			 * (ctx.list->next) with an unknown lifetime across unlocking the list. */
-			prev = list_prev_entry(ctx, list);
-			list_del(&ctx->list);
-			kfree(ctx);
-			ctx = prev;
-		} else if (ctx->peer == peer) {
-			/* Don't traverse past the first non-encrypted packet. */
-			break;
+			return ctx;
+		} else if (no_gaps && ctx->peer == peer) {
+			/* Don't traverse past a packet for this peer of a different state. */
+			spin_unlock_bh(&peer->device->tx_superqueue_lock);
+			return ERR_PTR(-EBUSY);
 		}
 	}
 	spin_unlock_bh(&peer->device->tx_superqueue_lock);
+
+	return ERR_PTR(-ENOENT);
+}
+
+static inline struct encryption_ctx *claim_next_ctx(struct wireguard_peer *peer,
+						    struct encryption_ctx *ctx,
+						    int state,
+						    bool no_gaps)
+{
+	list_for_each_entry_continue(ctx, &peer->device->tx_superqueue, list) {
+		if (ctx->peer == peer && atomic_cmpxchg(&ctx->state, state, state + 1) == state) {
+			return ctx;
+		} else if (no_gaps && ctx->peer == peer) {
+			/* Don't traverse past a packet for this peer of a different state. */
+			return ERR_PTR(-EBUSY);
+		}
+	}
+
+	return ERR_PTR(-ENOENT);
+}
+
+void transmit_packet_worker(struct work_struct *work)
+{
+	bool data_sent;
+	struct encryption_ctx *ctx, *next = NULL;
+	struct sk_buff *skb, *tmp;
+	struct wireguard_peer *peer = container_of(work, struct wireguard_peer, transmit_packet_work);
+
+	while (1) {
+		if (IS_ERR(ctx = (next ? next : claim_first_ctx(peer, PACKET_TX_ENCRYPTED, true))))
+			break;
+
+		/* Can't do this in encrypt_packet_worker because ctx might get
+		 * freed before queue_work_on() returns. */
+		noise_keypair_put(ctx->keypair);
+
+		/* This can only happen if skb_encrypt fails for an entire subqueue. */
+		if (WARN_ON(!skb_queue_len(&ctx->queue)))
+			goto done;
+
+		timers_any_authenticated_packet_traversal(peer);
+
+		data_sent = false;
+		skb_queue_walk_safe (&ctx->queue, skb, tmp) {
+			bool is_keepalive = skb->len == message_data_len(0);
+			if (likely(!socket_send_skb_to_peer(peer, skb, PACKET_CB(skb)->ds) && !is_keepalive))
+				data_sent = true;
+		}
+		if (likely(data_sent))
+			timers_data_sent(peer);
+		send_keep_key_fresh(peer);
+
+done:
+		next = claim_next_ctx(peer, ctx, PACKET_TX_ENCRYPTED, true);
+		spin_lock_bh(&peer->device->tx_superqueue_lock);
+		list_del(&ctx->list);
+		kfree(ctx);
+		spin_unlock_bh(&peer->device->tx_superqueue_lock);
+	}
 }
 
 void encrypt_packet_worker(struct work_struct *work)
 {
 	bool have_simd;
-	struct encryption_ctx *ctx;
+	struct encryption_ctx *ctx, *next = NULL;
 	struct sk_buff *skb, *tmp;
 	struct wireguard_device *wg = container_of(work, struct per_cpu_work, work)->wg;
 
-	spin_lock_bh(&wg->tx_superqueue_lock);
-	list_for_each_entry(ctx, &wg->tx_superqueue, list) {
-		if (ctx->state == PACKET_TX_INITED) {
-			ctx->state = PACKET_TX_ENCRYPTING;
-			spin_unlock_bh(&wg->tx_superqueue_lock);
+	while (1) {
+		if (IS_ERR(ctx = (next ? next : claim_first_ctx_any_peer(wg, PACKET_TX_INITED))))
+			break;
 
-			have_simd = chacha20poly1305_init_simd();
-			skb_queue_walk_safe (&ctx->queue, skb, tmp) {
-				if (unlikely(!skb_encrypt(skb, ctx->keypair, have_simd))) {
-					/* FIXME: dropping packets??? */
-					__skb_unlink(skb, &ctx->queue);
-					kfree_skb(skb);
-					continue;
-				}
-				skb_reset(skb);
+		WARN_ON(atomic_read(&ctx->state) != PACKET_TX_ENCRYPTING);
+
+		have_simd = chacha20poly1305_init_simd();
+		skb_queue_walk_safe (&ctx->queue, skb, tmp) {
+			if (unlikely(!skb_encrypt(skb, ctx->keypair, have_simd))) {
+				/* FIXME: dropping packets??? */
+				__skb_unlink(skb, &ctx->queue);
+				kfree_skb(skb);
+				continue;
 			}
-			chacha20poly1305_deinit_simd(have_simd);
-
-			spin_lock_bh(&wg->tx_superqueue_lock);
-			/* Forward progress */
-			ctx->state = PACKET_TX_ENCRYPTED;
-			queue_work_on(choose_cpu(ctx->keypair->remote_index), ctx->peer->device->crypt_wq, &ctx->peer->transmit_packet_work);
+			skb_reset(skb);
 		}
+		chacha20poly1305_deinit_simd(have_simd);
+
+		next = claim_next_ctx_any_peer(wg, ctx, PACKET_TX_INITED);
+		atomic_set(&ctx->state, PACKET_TX_ENCRYPTED);
+		queue_work_on(choose_cpu(ctx->keypair->remote_index), ctx->peer->device->crypt_wq, &ctx->peer->transmit_packet_work);
 	}
-	spin_unlock_bh(&wg->tx_superqueue_lock);
 }
 
 static inline int next_encryption_cpu(struct wireguard_device *wg)
@@ -312,53 +369,42 @@ static inline int next_encryption_cpu(struct wireguard_device *wg)
 void init_packet_worker(struct work_struct *work)
 {
 	int cpu;
-	struct encryption_ctx *ctx;
+	struct encryption_ctx *ctx, *next = NULL;
 	struct sk_buff *skb;
 	struct wireguard_peer *peer = container_of(work, struct wireguard_peer, init_packet_work);
 
-	spin_lock_bh(&peer->device->tx_superqueue_lock);
-	list_for_each_entry(ctx, &peer->device->tx_superqueue, list) {
-		if (ctx->peer == peer && ctx->state == PACKET_TX_NEW) {
-			ctx->state = PACKET_TX_INITING;
-			spin_unlock_bh(&peer->device->tx_superqueue_lock);
+	while (1) {
+		if (IS_ERR(ctx = (next ? next : claim_first_ctx(peer, PACKET_TX_NEW, false))))
+			break;
 
-			rcu_read_lock_bh();
-			ctx->keypair = noise_keypair_get(rcu_dereference_bh(peer->keypairs.current_keypair));
-			rcu_read_unlock_bh();
-			if (unlikely(!ctx->keypair)) {
-				net_dbg_ratelimited("%s: No key for peer %Lu (%pISpfsc), so start a handshake!\n", netdev_pub(peer->device)->name, peer->internal_id, &peer->endpoint.addr);
-				packet_queue_handshake_initiation(peer, false);
+		rcu_read_lock_bh();
+		ctx->keypair = noise_keypair_get(rcu_dereference_bh(peer->keypairs.current_keypair));
+		rcu_read_unlock_bh();
+		if (unlikely(!ctx->keypair)) {
+			net_dbg_ratelimited("%s: No key for peer %Lu (%pISpfsc), so start a handshake!\n", netdev_pub(peer->device)->name, peer->internal_id, &peer->endpoint.addr);
+fail:
+			atomic_set(&ctx->state, PACKET_TX_NEW);
+			packet_queue_handshake_initiation(peer, false);
+			return;
+		}
+		skb_queue_walk (&ctx->queue, skb) {
+			if (unlikely(!get_encryption_nonce(&PACKET_CB(skb)->nonce, &ctx->keypair->sending))) {
+				net_dbg_ratelimited("%s: Invalid key for peer %Lu (%pISpfsc), so start a handshake!\n", netdev_pub(peer->device)->name, peer->internal_id, &peer->endpoint.addr);
+				noise_keypair_put(ctx->keypair);
 				goto fail;
 			}
-			skb_queue_walk (&ctx->queue, skb) {
-				if (unlikely(!get_encryption_nonce(&PACKET_CB(skb)->nonce, &ctx->keypair->sending))) {
-					net_dbg_ratelimited("%s: Invalid key for peer %Lu (%pISpfsc), but we didn't start a handshake!\n", netdev_pub(peer->device)->name, peer->internal_id, &peer->endpoint.addr);
-					goto fail_keypair;
-				}
-			}
-
-			spin_lock_bh(&peer->device->tx_superqueue_lock);
-			/* Forward progress */
-			ctx->state = PACKET_TX_INITED;
-			cpu = next_encryption_cpu(peer->device);
-			queue_work_on(cpu, peer->device->crypt_wq, &per_cpu_ptr(peer->device->encrypt_packet_work, cpu)->work);
-			continue;
-
-fail_keypair:
-			noise_keypair_put(ctx->keypair);
-fail:
-			spin_lock_bh(&peer->device->tx_superqueue_lock);
-			/* Retry it when the handshake comes back. */
-			ctx->state = PACKET_TX_NEW;
-			break;
 		}
+
+		next = claim_next_ctx(peer, ctx, PACKET_TX_NEW, false);
+		atomic_set(&ctx->state, PACKET_TX_INITED);
+		cpu = next_encryption_cpu(peer->device);
+		queue_work_on(cpu, peer->device->crypt_wq, &per_cpu_ptr(peer->device->encrypt_packet_work, cpu)->work);
 	}
-	spin_unlock_bh(&peer->device->tx_superqueue_lock);
 }
 
 int packet_enqueue_list(struct wireguard_peer *peer, struct sk_buff_head *queue)
 {
-	u8 state;
+	bool has_nonce = false;
 	struct encryption_ctx *ctx;
 	struct sk_buff *skb;
 
@@ -383,19 +429,18 @@ int packet_enqueue_list(struct wireguard_peer *peer, struct sk_buff_head *queue)
 				goto fail;
 			}
 		}
-		ctx->state = PACKET_TX_INITED;
+		has_nonce = true;
 	} else {
 fail:
 		packet_queue_handshake_initiation(peer, false);
-		ctx->state = PACKET_TX_NEW;
 	}
-	state = ctx->state;
+	atomic_set(&ctx->state, has_nonce ? PACKET_TX_INITED : PACKET_TX_NEW);
 
 	spin_lock_bh(&peer->device->tx_superqueue_lock);
 	list_add_tail(&ctx->list, &peer->device->tx_superqueue);
 	spin_unlock_bh(&peer->device->tx_superqueue_lock);
 
-	if (state == PACKET_TX_INITED) {
+	if (has_nonce) {
 		int cpu = next_encryption_cpu(peer->device);
 		queue_work_on(cpu, peer->device->crypt_wq, &per_cpu_ptr(peer->device->encrypt_packet_work, cpu)->work);
 	} else {
