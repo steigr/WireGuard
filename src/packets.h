@@ -43,7 +43,6 @@ void packet_process_queued_handshake_packets(struct work_struct *work);
 void packet_consume_data_done(struct sk_buff *skb, struct wireguard_peer *peer, struct endpoint *endpoint, bool used_new_key);
 
 /* send.c */
-void packet_send_queue(struct wireguard_peer *peer);
 void packet_send_keepalive(struct wireguard_peer *peer);
 void packet_queue_handshake_initiation(struct wireguard_peer *peer, bool is_retry);
 void packet_send_queued_handshakes(struct work_struct *work);
@@ -55,6 +54,8 @@ void packet_create_data_done(struct sk_buff_head *queue, struct wireguard_peer *
 /* data.c */
 int packet_create_data(struct sk_buff_head *queue, struct wireguard_peer *peer);
 void packet_consume_data(struct sk_buff *skb, struct wireguard_device *wg);
+
+void packet_queue_purge(struct wireguard_peer *peer);
 
 int packet_init_data_caches(void);
 void packet_deinit_data_caches(void);
