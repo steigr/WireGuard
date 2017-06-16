@@ -26,11 +26,9 @@ static int __init mod_init(void)
 #endif
 	noise_init();
 
-#ifdef CONFIG_WIREGUARD_PARALLEL
 	ret = packet_init_data_caches();
 	if (ret < 0)
 		goto err_packet;
-#endif
 
 	ret = device_init();
 	if (ret < 0)
@@ -42,19 +40,15 @@ static int __init mod_init(void)
 	return 0;
 
 err_device:
-#ifdef CONFIG_WIREGUARD_PARALLEL
 	packet_deinit_data_caches();
 err_packet:
-#endif
 	return ret;
 }
 
 static void __exit mod_exit(void)
 {
 	device_uninit();
-#ifdef CONFIG_WIREGUARD_PARALLEL
 	packet_deinit_data_caches();
-#endif
 	pr_debug("WireGuard unloaded\n");
 }
 
