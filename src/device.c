@@ -319,7 +319,7 @@ static int newlink(struct net *src_net, struct net_device *dev, struct nlattr *t
 	if (!dev->tstats)
 		goto error_1;
 
-	wg->incoming_handshakes_worker = alloc_percpu(struct handshake_worker);
+	wg->incoming_handshakes_worker = alloc_percpu(struct percpu_worker);
 	if (!wg->incoming_handshakes_worker)
 		goto error_2;
 	for_each_possible_cpu (cpu) {

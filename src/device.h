@@ -16,7 +16,7 @@
 #include <linux/padata.h>
 
 struct wireguard_device;
-struct handshake_worker {
+struct percpu_worker {
 	struct wireguard_device *wg;
 	struct work_struct work;
 };
@@ -31,7 +31,7 @@ struct wireguard_device {
 	struct workqueue_struct *incoming_handshake_wq, *peer_wq;
 	struct sk_buff_head incoming_handshakes;
 	atomic_t incoming_handshake_seqnr;
-	struct handshake_worker __percpu *incoming_handshakes_worker;
+	struct percpu_worker __percpu *incoming_handshakes_worker;
 	struct cookie_checker cookie_checker;
 	struct pubkey_hashtable peer_hashtable;
 	struct index_hashtable index_hashtable;
