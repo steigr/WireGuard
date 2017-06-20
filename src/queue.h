@@ -7,6 +7,12 @@
 
 #include "device.h"
 
+/**
+ * The helper functions in this file rely on these states being in increasing
+ * order of the way packets are processed, and they must alternate between in-
+ * progress and completed states. The exception is CTX_FREEING, because it does
+ * not use these helpers.
+ */
 enum {
 	CTX_NEW = 0,
 	CTX_INITIALIZING,
@@ -78,14 +84,14 @@ static inline struct crypt_ctx *dequeue_ctx(struct list_head *queue,
 {
 	struct crypt_ctx *ctx;
 
-	/* We need to ensure the lifetime of second (for all iterations). */
+	/* We need to ensure the lifetimes here and in del_ctx(). */
 	rcu_read_lock_bh();
 	ctx = list_first_or_null_rcu(queue, struct crypt_ctx, list);
 	while (ctx && ctx->peer != peer)
 		ctx = list_next_or_null_rcu(queue, &ctx->list,
 					    struct crypt_ctx, list);
-	/* Don't traverse past ctx's for this peer with other states. This is
-	 * important for transmission to avoid out-of-order delivery. */
+	/* Don't traverse past ctx's for this peer with other states. This helps
+	 * avoid out-of-order delivery. */
 	if (!ctx || atomic_read(&ctx->state) != state) {
 		rcu_read_unlock_bh();
 		return NULL;
@@ -97,13 +103,13 @@ static inline struct crypt_ctx *dequeue_ctx(struct list_head *queue,
 }
 
 /**
- * ctx->state mus be set correctly before calling this helper.
+ * ctx->state must be set correctly before calling this helper.
  */
 static inline void enqueue_ctx(struct list_head *queue, struct crypt_ctx *ctx)
 {
 	struct list_head *prev;
 
-	/* The enqueued context will always be the prev, so this is safe. */
+	/* The enqueued context will always be last, so this needs no lock. */
 	list_next_rcu(&ctx->list) = queue;
 	/* We need to ensure the lifetime of prev (for all iterations). */
 	rcu_read_lock_bh();
