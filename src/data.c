@@ -20,7 +20,7 @@ static struct kmem_cache *crypt_ctx_cache __read_mostly;
 
 int __init packet_init_data_caches(void)
 {
-	crypt_ctx_cache = kmem_cache_create("wireguard_crypt_ctx", sizeof(struct crypt_ctx), 0, 0, NULL);
+	crypt_ctx_cache = KMEM_CACHE(crypt_ctx, 0);
 	if (!crypt_ctx_cache)
 		return -ENOMEM;
 	return 0;
