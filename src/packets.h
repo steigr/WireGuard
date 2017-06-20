@@ -38,14 +38,14 @@ void packet_create_data_done(struct sk_buff_head *queue, struct wireguard_peer *
 int packet_create_data(struct sk_buff_head *queue, struct wireguard_peer *peer);
 void packet_consume_data(struct sk_buff *skb, struct wireguard_device *wg);
 
-void packet_queue_purge(struct wireguard_peer *peer);
-
 int packet_init_data_caches(void);
 void packet_deinit_data_caches(void);
 
 void packet_encryption_worker(struct work_struct *work);
 void packet_initialization_worker(struct work_struct *work);
 void packet_transmission_worker(struct work_struct *work);
+
+void peer_purge_queues(struct wireguard_peer *peer);
 
 #ifdef DEBUG
 bool packet_counter_selftest(void);
