@@ -395,7 +395,7 @@ static struct rtnl_link_ops link_ops __read_mostly = {
 	.newlink		= newlink,
 };
 
-int device_init(void)
+int __init device_init(void)
 {
 #ifdef CONFIG_PM_SLEEP
 	int ret = register_pm_notifier(&clear_peers_on_suspend);
@@ -405,7 +405,7 @@ int device_init(void)
 	return rtnl_link_register(&link_ops);
 }
 
-void device_uninit(void)
+void __exit device_uninit(void)
 {
 	rtnl_link_unregister(&link_ops);
 #ifdef CONFIG_PM_SLEEP
