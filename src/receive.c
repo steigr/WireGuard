@@ -187,7 +187,7 @@ void packet_consume_data_done(struct sk_buff *skb, struct wireguard_peer *peer, 
 
 	if (unlikely(used_new_key)) {
 		timers_handshake_complete(peer);
-		queue_work(wg->crypt_wq, &peer->packet_initialization_work);
+		queue_work(wg->crypt_wq, &peer->init_queue.work);
 	}
 
 	keep_key_fresh(peer);
